@@ -1,5 +1,6 @@
 mod claude_cli;
 mod config;
+mod pages;
 #[cfg(feature = "mupdf")]
 mod pdf;
 mod transcriber;
@@ -17,12 +18,15 @@ use clap::Parser;
 use std::time::Duration;
 
 use config::Config;
-#[cfg(feature = "mupdf")]
-use pdf::Pdf;
+use pages::PageSource;
 use transcriber::{Fatal, RetryConfig, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
 const PAGE_BREAK: &str = "<<<--- PAGE BREAK --->>>";
+
+/// Resolution for rendering document pages when neither `--dpi` nor the
+/// model's `dpi` is set.
+const DEFAULT_DPI: f32 = 200.0;
 
 const DEFAULT_PROMPT: &str = "\
 You are transcribing scanned pages of a book into clean Markdown plain text. \
@@ -80,9 +84,10 @@ struct Args {
     jobs: Option<usize>,
 
     /// Resolution to render PDF pages at (PDF input only). Lower values hurt
-    /// OCR quality; ~200-300 is a good range.
-    #[arg(long, default_value_t = 200.0)]
-    dpi: f32,
+    /// OCR quality; ~200-300 is a good range. Default: the model's `dpi` from
+    /// the config, else 200.
+    #[arg(long)]
+    dpi: Option<f32>,
 }
 
 /// A temporary directory removed when this guard is dropped.
@@ -91,8 +96,6 @@ struct TempDir {
 }
 
 impl TempDir {
-    // Only PDF rendering needs a temp dir, and that is feature-gated for now.
-    #[cfg_attr(not(feature = "mupdf"), allow(dead_code))]
     fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("book_transcriber-{}", std::process::id()));
         std::fs::create_dir_all(&path)
@@ -130,6 +133,10 @@ fn run() -> Result<()> {
     };
     let config = Config::load(&config_path)?;
     let model = config.resolve(args.model.as_deref())?;
+    let dpi = args.dpi.or(model.model.dpi).unwrap_or(DEFAULT_DPI);
+    if dpi.is_nan() || dpi <= 0.0 {
+        bail!("DPI must be positive, got {dpi}");
+    }
 
     // Directory output => one file per page; no output => a single combined file
     // named after the input.
@@ -169,7 +176,8 @@ or give an output directory to write one file per page",
     // finishes.
     let mut _tmp: Option<TempDir> = None;
     let pending = if is_pdf(&args.input) {
-        let (pages, tmp) = pdf_pages(&args, &output)?;
+        let doc = pages::open_pdf(&args.input)?;
+        let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), "PDF", dpi)?;
         _tmp = Some(tmp);
         pages
     } else if args.input.is_dir() {
@@ -381,27 +389,26 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
     Ok(pending)
 }
 
-/// PDF rendering is unavailable without the `mupdf` feature.
-#[cfg(not(feature = "mupdf"))]
-fn pdf_pages(_args: &Args, _output: &Output) -> Result<(Vec<Page>, TempDir)> {
-    bail!("PDF input requires building with `--features mupdf`")
-}
-
-/// Selected, not-yet-done pages from a PDF. Each pending page is rendered to a
-/// PNG in a temp directory (returned so it outlives transcription); in per-page
-/// mode output files are named by page number (e.g. `3.md`).
-#[cfg(feature = "mupdf")]
-fn pdf_pages(args: &Args, output: &Output) -> Result<(Vec<Page>, TempDir)> {
-    let doc = Pdf::open(&args.input)?;
-    let total = doc.page_count()? as usize;
+/// Selected, not-yet-done pages from a paged document such as a PDF (`kind`
+/// names it in messages). Each pending page is rendered to a PNG in a temp
+/// directory (returned so it outlives transcription); in per-page mode output
+/// files are named by page number (e.g. `3.md`).
+fn document_pages(
+    args: &Args,
+    output: &Output,
+    doc: &dyn PageSource,
+    kind: &str,
+    dpi: f32,
+) -> Result<(Vec<Page>, TempDir)> {
+    let total = doc.page_count()?;
     if total == 0 {
-        bail!("PDF {} has no pages", args.input.display());
+        bail!("{kind} {} has no pages", args.input.display());
     }
 
     let start_idx = args.start - 1;
     if start_idx >= total {
         bail!(
-            "--start {} is past the last page ({total} pages in the PDF)",
+            "--start {} is past the last page ({total} pages in the {kind})",
             args.start
         );
     }
@@ -410,8 +417,8 @@ fn pdf_pages(args: &Args, output: &Output) -> Result<(Vec<Page>, TempDir)> {
         None => total,
     };
     println!(
-        "PDF: {total} pages; rendering pages {}..={end} at {:.0} DPI.",
-        args.start, args.dpi
+        "{kind}: {total} pages; rendering pages {}..={end} at {dpi:.0} DPI.",
+        args.start
     );
 
     let tmp = TempDir::new()?;
@@ -425,9 +432,9 @@ fn pdf_pages(args: &Args, output: &Output) -> Result<(Vec<Page>, TempDir)> {
             skipped += 1;
             continue;
         }
-        let png = doc.render_page_png((page - 1) as i32, args.dpi)?;
         let image = tmp.path.join(format!("{name}.png"));
-        std::fs::write(&image, png).with_context(|| format!("writing {}", image.display()))?;
+        doc.render_png(page, dpi, &image)
+            .with_context(|| format!("rendering {kind} page {page}"))?;
         pending.push(Page {
             image,
             label: format!("page {page}"),

@@ -80,6 +80,11 @@ pub struct ModelConfig {
     /// (default: `DEFAULT_MAX_COMPLETION_TOKENS`).
     #[serde(default)]
     pub max_completion_tokens: Option<u32>,
+    /// Resolution to render document pages at for this model; `--dpi`
+    /// overrides it. Lets models that downscale large images anyway get
+    /// smaller renders.
+    #[serde(default)]
+    pub dpi: Option<f32>,
     /// Optional pricing, USD per 1M tokens, used only for cost reporting.
     #[serde(default)]
     pub input_price_per_mtok: Option<f64>,

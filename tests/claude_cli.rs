@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAdSURBVDhPY/jPwPCfEsyALkAqHjVg1IBRAwaLAQAwxP4Q7zYsrwAAAABJRU5ErkJggg==";
 
 const NOT_LOGGED_IN: &str = include_str!("fixtures/claude_cli/not_logged_in.jsonl");
+const BLANK_PDF: &[u8] = include_bytes!("fixtures/blank-2-pages.pdf");
 
 /// Selects the fake's behavior; unset means success.
 const MODE_VAR: &str = "FAKE_CLAUDE_MODE";
@@ -35,6 +36,12 @@ fn main() {
     println!("test transcribes_pages_through_the_cli ... ok");
     not_logged_in_stops_the_run();
     println!("test not_logged_in_stops_the_run ... ok");
+    if Command::new("pdftoppm").arg("-v").output().is_ok() {
+        transcribes_a_pdf_with_diacritics_in_its_path();
+        println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
+    } else {
+        println!("test transcribes_a_pdf_with_diacritics_in_its_path ... skipped (Poppler is not installed)");
+    }
 }
 
 // ---- the fake `claude` ----
@@ -155,8 +162,9 @@ struct Fixture {
 
 impl Fixture {
     fn new(name: &str) -> Self {
+        // Diacritics and spaces in every path, as is common on Windows.
         let root = std::env::temp_dir().join(format!(
-            "book_transcriber-test-{}-{name}",
+            "book_transcriber test časť {}-{name}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&root);
@@ -193,13 +201,25 @@ impl Fixture {
         }
     }
 
+    /// Transcribe the image directory into the per-page output directory.
     fn run(&self, mode: Option<&str>) -> Output {
+        self.run_with(&self.book, Some(&self.out), mode)
+    }
+
+    fn run_with(&self, input: &Path, output: Option<&Path>, mode: Option<&str>) -> Output {
+        let book_dir = if input.is_dir() {
+            input
+        } else {
+            input.parent().unwrap()
+        };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_book_transcriber"));
-        cmd.arg(&self.book)
-            .arg(&self.out)
-            .arg("--config")
+        cmd.arg(input);
+        if let Some(output) = output {
+            cmd.arg(output);
+        }
+        cmd.arg("--config")
             .arg(&self.config)
-            .env(BOOK_DIR_VAR, &self.book)
+            .env(BOOK_DIR_VAR, book_dir)
             .env_remove(MODE_VAR);
         if let Some(mode) = mode {
             cmd.env(MODE_VAR, mode);
@@ -244,4 +264,25 @@ fn not_logged_in_stops_the_run() {
     assert!(stderr.contains("log in"), "{stderr}");
     assert!(stderr.contains("1 batch(es) were not attempted"), "{stderr}");
     assert!(!fixture.out.join("1.md").exists());
+}
+
+fn transcribes_a_pdf_with_diacritics_in_its_path() {
+    let fixture = Fixture::new("pdf");
+    let pdf = fixture.root.join("Kniha – časť 1.pdf");
+    std::fs::write(&pdf, BLANK_PDF).unwrap();
+
+    // No output argument: both pages go into one file next to the PDF.
+    let output = fixture.run_with(&pdf, None, None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("PDF: 2 pages"), "{stdout}");
+    let text = std::fs::read_to_string(fixture.root.join("Kniha – časť 1.md")).unwrap();
+    assert_eq!(
+        text,
+        "Fake transcription of 1 image(s).\n\nFake transcription of 1 image(s)."
+    );
 }

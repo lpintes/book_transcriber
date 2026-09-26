@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use mupdf::pixmap::ImageFormat;
 use mupdf::{Colorspace, Document, Matrix};
 
+use crate::pages::PageSource;
+
 /// A PDF opened for rendering pages to raster images.
 pub struct Pdf {
     doc: Document,
@@ -16,13 +18,9 @@ impl Pdf {
         Ok(Self { doc })
     }
 
-    pub fn page_count(&self) -> Result<i32> {
-        self.doc.page_count().context("reading PDF page count")
-    }
-
     /// Render 0-based `index` to PNG bytes at the given DPI (PDF user space is
     /// 72 units/inch, so the scale factor is `dpi / 72`).
-    pub fn render_page_png(&self, index: i32, dpi: f32) -> Result<Vec<u8>> {
+    fn render_page_png(&self, index: i32, dpi: f32) -> Result<Vec<u8>> {
         let page = self
             .doc
             .load_page(index)
@@ -38,5 +36,17 @@ impl Pdf {
             .write_to(&mut png, ImageFormat::PNG)
             .with_context(|| format!("encoding PDF page {} as PNG", index + 1))?;
         Ok(png)
+    }
+}
+
+impl PageSource for Pdf {
+    fn page_count(&self) -> Result<usize> {
+        let count = self.doc.page_count().context("reading PDF page count")?;
+        Ok(count.max(0) as usize)
+    }
+
+    fn render_png(&self, page: usize, dpi: f32, dest: &Path) -> Result<()> {
+        let png = self.render_page_png((page - 1) as i32, dpi)?;
+        std::fs::write(dest, png).with_context(|| format!("writing {}", dest.display()))
     }
 }
