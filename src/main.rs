@@ -3,6 +3,7 @@ mod config;
 mod pages;
 #[cfg(feature = "mupdf")]
 mod pdf;
+mod tools;
 mod transcriber;
 
 use std::cmp::Ordering;
@@ -17,8 +18,9 @@ use clap::Parser;
 
 use std::time::Duration;
 
-use config::Config;
-use pages::PageSource;
+use config::{Config, Endpoint};
+use pages::{DocumentKind, PageSource};
+use tools::Requirement;
 use transcriber::{Fatal, RetryConfig, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
@@ -37,7 +39,8 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 /// Transcribe a directory of scanned book pages into Markdown using a
 /// vision-capable LLM.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+// Plain text only: colored output reads poorly with a screen reader.
+#[command(version, about, color = clap::ColorChoice::Never)]
 struct Args {
     /// Input source: a directory of images (.png / .jpg / .jpeg), a .pdf file
     /// or a .djvu file.
@@ -139,6 +142,22 @@ fn run() -> Result<()> {
         bail!("DPI must be positive, got {dpi}");
     }
 
+    let document = DocumentKind::of(&args.input);
+    if document.is_none() && !args.input.is_dir() {
+        bail!(
+            "input {} is neither a .pdf or .djvu file nor a directory",
+            args.input.display()
+        );
+    }
+
+    // Report missing external programs before creating or rendering anything.
+    let mut requirements: Vec<Requirement> =
+        document.and_then(DocumentKind::requirement).into_iter().collect();
+    if let Endpoint::ClaudeCli { command, .. } = model.endpoint {
+        requirements.push(Requirement::claude_cli(command));
+    }
+    tools::check(&requirements)?;
+
     // Directory output => one file per page; no output => a single combined file
     // named after the input.
     let output = match &args.output {
@@ -176,25 +195,14 @@ or give an output directory to write one file per page",
     // For a document, rendered page images live in `_tmp`, kept alive until the run
     // finishes.
     let mut _tmp: Option<TempDir> = None;
-    let document: Option<(Box<dyn PageSource>, &str)> =
-        if is_file_with_extension(&args.input, "pdf") {
-            Some((pages::open_pdf(&args.input)?, "PDF"))
-        } else if is_file_with_extension(&args.input, "djvu") {
-            Some((Box::new(pages::DjVu::new(&args.input)), "DjVu"))
-        } else {
-            None
-        };
-    let pending = if let Some((doc, kind)) = document {
-        let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), kind, dpi)?;
-        _tmp = Some(tmp);
-        pages
-    } else if args.input.is_dir() {
-        image_dir_pages(&args, &output)?
-    } else {
-        bail!(
-            "input {} is neither a .pdf or .djvu file nor a directory",
-            args.input.display()
-        );
+    let pending = match document {
+        Some(kind) => {
+            let doc = kind.open(&args.input)?;
+            let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), kind.name(), dpi)?;
+            _tmp = Some(tmp);
+            pages
+        }
+        None => image_dir_pages(&args, &output)?,
     };
 
     if pending.is_empty() {
@@ -325,16 +333,6 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-/// Whether `path` is a file with extension `ext`, ignoring case.
-fn is_file_with_extension(path: &Path, ext: &str) -> bool {
-    path.is_file()
-        && path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case(ext))
-            .unwrap_or(false)
-}
-
 /// The destination file for one page in per-page mode, or `None` in single-file
 /// mode. Returns `None` via the `skip` flag when the file already exists and
 /// resume is active (per-page mode only).
@@ -388,7 +386,7 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
     }
 
     println!(
-        "Pages {}..={} of {} selected; {} to transcribe, {} already done.",
+        "Pages {} to {} of {} selected; {} to transcribe, {} already done.",
         args.start,
         end_idx,
         images.len(),
@@ -426,7 +424,7 @@ fn document_pages(
         None => total,
     };
     println!(
-        "{kind}: {total} pages; rendering pages {}..={end} at {dpi:.0} DPI.",
+        "{kind}: {total} pages; rendering pages {} to {end} at {dpi:.0} DPI.",
         args.start
     );
 
@@ -453,7 +451,7 @@ fn document_pages(
     }
 
     println!(
-        "Pages {}..={end} selected; {} to transcribe, {skipped} already done.",
+        "Pages {} to {end} selected; {} to transcribe, {skipped} already done.",
         args.start,
         pending.len()
     );
@@ -522,7 +520,7 @@ the last one."
 fn batch_label(batch: &[Page]) -> String {
     match (batch.first(), batch.last()) {
         (Some(first), _) if batch.len() == 1 => first.label.clone(),
-        (Some(first), Some(last)) => format!("{}..{}", first.label, last.label),
+        (Some(first), Some(last)) => format!("{} to {}", first.label, last.label),
         _ => String::from("(empty)"),
     }
 }
@@ -651,11 +649,13 @@ fn file_stem(path: &Path) -> String {
 }
 
 fn report_usage(total: &Usage, model: &config::ResolvedModel<'_>) {
+    // One "label: value" per line, without column padding, so screen readers
+    // don't stumble over runs of spaces.
     println!("\nToken usage:");
-    println!("  prompt (input):     {}", total.prompt_tokens);
-    println!("  completion (output):{}", total.completion_tokens);
+    println!("  input tokens: {}", total.prompt_tokens);
+    println!("  output tokens: {}", total.completion_tokens);
     println!(
-        "  total:              {}",
+        "  total tokens: {}",
         total.prompt_tokens + total.completion_tokens
     );
 
@@ -664,11 +664,11 @@ fn report_usage(total: &Usage, model: &config::ResolvedModel<'_>) {
     if in_price.is_some() || out_price.is_some() {
         let cost = total.prompt_tokens as f64 / 1e6 * in_price.unwrap_or(0.0)
             + total.completion_tokens as f64 / 1e6 * out_price.unwrap_or(0.0);
-        println!("  estimated cost:     ${cost:.4}");
+        println!("  estimated cost: ${cost:.4}");
     }
     if let Some(cost) = total.cost_usd {
         println!(
-            "  reported cost:      ${cost:.4} (the backend's own estimate; \
+            "  reported cost: ${cost:.4} (the backend's own estimate; \
 with a subscription this is only indicative)"
         );
     }

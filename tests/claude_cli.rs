@@ -37,6 +37,8 @@ fn main() {
     println!("test transcribes_pages_through_the_cli ... ok");
     not_logged_in_stops_the_run();
     println!("test not_logged_in_stops_the_run ... ok");
+    missing_cli_is_reported_up_front();
+    println!("test missing_cli_is_reported_up_front ... ok");
     if Command::new("pdftoppm").arg("-v").output().is_ok() {
         transcribes_a_pdf_with_diacritics_in_its_path();
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
@@ -258,9 +260,9 @@ fn transcribes_pages_through_the_cli() {
     // claude-cli defaults to one request at a time.
     assert!(!stdout.contains("in parallel"), "{stdout}");
     // Two requests, each 100 + 20 + 3 input and 7 output tokens.
-    assert!(stdout.contains("prompt (input):     246"), "{stdout}");
-    assert!(stdout.contains("completion (output):14"), "{stdout}");
-    assert!(stdout.contains("reported cost:      $0.0200"), "{stdout}");
+    assert!(stdout.contains("input tokens: 246"), "{stdout}");
+    assert!(stdout.contains("output tokens: 14"), "{stdout}");
+    assert!(stdout.contains("reported cost: $0.0200"), "{stdout}");
 }
 
 fn not_logged_in_stops_the_run() {
@@ -271,6 +273,28 @@ fn not_logged_in_stops_the_run() {
     assert!(stderr.contains("log in"), "{stderr}");
     assert!(stderr.contains("1 batch(es) were not attempted"), "{stderr}");
     assert!(!fixture.out.join("1.md").exists());
+}
+
+fn missing_cli_is_reported_up_front() {
+    let fixture = Fixture::new("missing-cli");
+    let exe = std::env::current_exe().unwrap();
+    let config = std::fs::read_to_string(&fixture.config).unwrap().replace(
+        &exe.display().to_string(),
+        "book-transcriber-no-such-claude",
+    );
+    std::fs::write(&fixture.config, config).unwrap();
+
+    let output = fixture.run(None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "btr should fail\n{stderr}");
+    assert!(
+        stderr.contains("Not found: book-transcriber-no-such-claude"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("install Claude Code"), "{stderr}");
+    // Nothing was created or attempted.
+    assert!(!fixture.out.exists());
+    assert!(!stderr.contains("failed:"), "{stderr}");
 }
 
 fn transcribes_a_pdf_with_diacritics_in_its_path() {

@@ -5,6 +5,8 @@ use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
 
+use crate::tools::Requirement;
+
 /// A paged document that can render single pages to PNG files.
 pub trait PageSource {
     fn page_count(&self) -> Result<usize>;
@@ -13,9 +15,57 @@ pub trait PageSource {
     fn render_png(&self, page: usize, dpi: f32, dest: &Path) -> Result<()>;
 }
 
+/// The document formats btr renders itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    Pdf,
+    DjVu,
+}
+
+impl DocumentKind {
+    /// The kind of an input file, judged by its extension (any case).
+    pub fn of(path: &Path) -> Option<Self> {
+        if !path.is_file() {
+            return None;
+        }
+        let ext = path.extension()?.to_str()?;
+        if ext.eq_ignore_ascii_case("pdf") {
+            Some(Self::Pdf)
+        } else if ext.eq_ignore_ascii_case("djvu") {
+            Some(Self::DjVu)
+        } else {
+            None
+        }
+    }
+
+    /// The name used in messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pdf => "PDF",
+            Self::DjVu => "DjVu",
+        }
+    }
+
+    /// External programs needed to render this kind, if any.
+    pub fn requirement(self) -> Option<Requirement> {
+        match self {
+            Self::Pdf if cfg!(feature = "mupdf") => None,
+            Self::Pdf => Some(Requirement::poppler()),
+            Self::DjVu => Some(Requirement::djvulibre()),
+        }
+    }
+
+    pub fn open(self, path: &Path) -> Result<Box<dyn PageSource>> {
+        match self {
+            Self::Pdf => open_pdf(path),
+            Self::DjVu => Ok(Box::new(DjVu::new(path))),
+        }
+    }
+}
+
 /// Open a PDF with MuPDF when built with the `mupdf` feature, otherwise with
 /// the external Poppler tools.
-pub fn open_pdf(path: &Path) -> Result<Box<dyn PageSource>> {
+fn open_pdf(path: &Path) -> Result<Box<dyn PageSource>> {
     #[cfg(feature = "mupdf")]
     {
         Ok(Box::new(crate::pdf::Pdf::open(path)?))
