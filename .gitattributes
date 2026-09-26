@@ -1,2 +1,3 @@
 # Byte offsets in PDF files break if line endings are converted.
 *.pdf binary
+*.djvu binary

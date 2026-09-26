@@ -76,6 +76,63 @@ impl PageSource for Poppler {
     }
 }
 
+/// A DjVu document rendered by DjVuLibre's `djvused` and `ddjvu`.
+pub struct DjVu {
+    path: PathBuf,
+}
+
+impl DjVu {
+    pub fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl PageSource for DjVu {
+    fn page_count(&self) -> Result<usize> {
+        let output = run_tool(
+            Command::new("djvused").args(["-e", "n"]).arg(&self.path),
+            "djvused",
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout.trim().parse().with_context(|| {
+            format!(
+                "djvused reported no page count for {}: {:?}",
+                self.path.display(),
+                stdout.trim()
+            )
+        })
+    }
+
+    fn render_png(&self, page: usize, dpi: f32, dest: &Path) -> Result<()> {
+        // ddjvu can't write PNG; render PNM next to the target and convert.
+        let pnm = dest.with_extension("pnm");
+        run_tool(
+            Command::new("ddjvu")
+                .arg("-format=pnm")
+                .arg(format!("-page={page}"))
+                // -scale is the output resolution in DPI.
+                .arg(format!("-scale={}", dpi.round() as u32))
+                .arg(&self.path)
+                .arg(&pnm),
+            "ddjvu",
+        )?;
+        let converted = pnm_to_png(&pnm, dest);
+        let _ = std::fs::remove_file(&pnm);
+        converted
+    }
+}
+
+fn pnm_to_png(pnm: &Path, png: &Path) -> Result<()> {
+    let bytes = std::fs::read(pnm).with_context(|| format!("reading {}", pnm.display()))?;
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Pnm)
+        .with_context(|| format!("decoding {}", pnm.display()))?;
+    image
+        .save_with_format(png, image::ImageFormat::Png)
+        .with_context(|| format!("writing {}", png.display()))
+}
+
 /// The value of the `Pages:` line in `pdfinfo` output.
 fn parse_pdfinfo_pages(output: &str) -> Option<usize> {
     output.lines().find_map(|line| {
@@ -108,6 +165,8 @@ mod tests {
     use super::*;
 
     const BLANK_PDF: &[u8] = include_bytes!("../tests/fixtures/blank-2-pages.pdf");
+    /// Two 16x16 red pages at 100 DPI.
+    const RED_DJVU: &[u8] = include_bytes!("../tests/fixtures/blank-2-pages.djvu");
 
     /// A fresh temp directory whose name has diacritics and spaces.
     fn diacritics_dir(name: &str) -> PathBuf {
@@ -151,6 +210,30 @@ mod tests {
         source.render_png(2, 72.0, &dest).unwrap();
         let png = std::fs::read(&dest).unwrap();
         assert!(png.starts_with(b"\x89PNG"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn djvu_handles_paths_with_diacritics() {
+        if !have_tool("djvused", "--help") || !have_tool("ddjvu", "--help") {
+            return;
+        }
+        let dir = diacritics_dir("djvu");
+        let djvu = dir.join("Kniha – časť 1.djvu");
+        std::fs::write(&djvu, RED_DJVU).unwrap();
+
+        let source = DjVu::new(&djvu);
+        assert_eq!(source.page_count().unwrap(), 2);
+        let dest = dir.join("strana 2.png");
+        // The pages are 100 DPI, so 200 DPI doubles their size.
+        source.render_png(2, 200.0, &dest).unwrap();
+        let png = image::open(&dest).unwrap().to_rgb8();
+        assert_eq!(png.dimensions(), (32, 32));
+        // Lossy IW44 compression keeps the page roughly red.
+        let [r, g, b] = png.get_pixel(16, 16).0;
+        assert!(r > 200 && g < 60 && b < 60, "{:?}", (r, g, b));
+        assert!(!dir.join("strana 2.pnm").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

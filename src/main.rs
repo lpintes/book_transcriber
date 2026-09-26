@@ -39,7 +39,8 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Input source: a directory of images (.png / .jpg / .jpeg) or a .pdf file.
+    /// Input source: a directory of images (.png / .jpg / .jpeg), a .pdf file
+    /// or a .djvu file.
     input: PathBuf,
 
     /// Output location. A directory writes one Markdown file per page (and a
@@ -83,7 +84,7 @@ struct Args {
     #[arg(short, long)]
     jobs: Option<usize>,
 
-    /// Resolution to render PDF pages at (PDF input only). Lower values hurt
+    /// Resolution to render PDF and DjVu pages at. Lower values hurt
     /// OCR quality; ~200-300 is a good range. Default: the model's `dpi` from
     /// the config, else 200.
     #[arg(long)]
@@ -171,20 +172,27 @@ or give an output directory to write one file per page",
         model.name, model.model.model_id, model.model.provider
     );
 
-    // Build the list of pages to transcribe from either a PDF or an image dir.
-    // For a PDF, rendered page images live in `_tmp`, kept alive until the run
+    // Build the list of pages to transcribe from a PDF, a DjVu or an image dir.
+    // For a document, rendered page images live in `_tmp`, kept alive until the run
     // finishes.
     let mut _tmp: Option<TempDir> = None;
-    let pending = if is_pdf(&args.input) {
-        let doc = pages::open_pdf(&args.input)?;
-        let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), "PDF", dpi)?;
+    let document: Option<(Box<dyn PageSource>, &str)> =
+        if is_file_with_extension(&args.input, "pdf") {
+            Some((pages::open_pdf(&args.input)?, "PDF"))
+        } else if is_file_with_extension(&args.input, "djvu") {
+            Some((Box::new(pages::DjVu::new(&args.input)), "DjVu"))
+        } else {
+            None
+        };
+    let pending = if let Some((doc, kind)) = document {
+        let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), kind, dpi)?;
         _tmp = Some(tmp);
         pages
     } else if args.input.is_dir() {
         image_dir_pages(&args, &output)?
     } else {
         bail!(
-            "input {} is neither a .pdf file nor a directory",
+            "input {} is neither a .pdf or .djvu file nor a directory",
             args.input.display()
         );
     };
@@ -300,7 +308,7 @@ enum Output {
 
 /// One page to transcribe.
 struct Page {
-    /// Source image (an input file, or a rendered PDF page in a temp dir).
+    /// Source image (an input file, or a rendered document page in a temp dir).
     image: PathBuf,
     /// Human-readable name for progress output (e.g. `12.png` or `page 3`).
     label: String,
@@ -317,12 +325,13 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-fn is_pdf(path: &Path) -> bool {
+/// Whether `path` is a file with extension `ext`, ignoring case.
+fn is_file_with_extension(path: &Path, ext: &str) -> bool {
     path.is_file()
         && path
             .extension()
             .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("pdf"))
+            .map(|e| e.eq_ignore_ascii_case(ext))
             .unwrap_or(false)
 }
 

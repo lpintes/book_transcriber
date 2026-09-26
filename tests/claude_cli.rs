@@ -19,6 +19,7 @@ const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAAXNSR0IAr
 
 const NOT_LOGGED_IN: &str = include_str!("fixtures/claude_cli/not_logged_in.jsonl");
 const BLANK_PDF: &[u8] = include_bytes!("fixtures/blank-2-pages.pdf");
+const RED_DJVU: &[u8] = include_bytes!("fixtures/blank-2-pages.djvu");
 
 /// Selects the fake's behavior; unset means success.
 const MODE_VAR: &str = "FAKE_CLAUDE_MODE";
@@ -41,6 +42,12 @@ fn main() {
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
     } else {
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... skipped (Poppler is not installed)");
+    }
+    if Command::new("ddjvu").arg("--help").output().is_ok() {
+        transcribes_remaining_djvu_pages();
+        println!("test transcribes_remaining_djvu_pages ... ok");
+    } else {
+        println!("test transcribes_remaining_djvu_pages ... skipped (DjVuLibre is not installed)");
     }
 }
 
@@ -285,4 +292,27 @@ fn transcribes_a_pdf_with_diacritics_in_its_path() {
         text,
         "Fake transcription of 1 image(s).\n\nFake transcription of 1 image(s)."
     );
+}
+
+fn transcribes_remaining_djvu_pages() {
+    let fixture = Fixture::new("djvu");
+    // The extension is matched case-insensitively.
+    let djvu = fixture.root.join("Kniha – časť 1.DJVU");
+    std::fs::write(&djvu, RED_DJVU).unwrap();
+    // Page 1 is already done and must be skipped.
+    std::fs::create_dir_all(&fixture.out).unwrap();
+    std::fs::write(fixture.out.join("1.md"), "done earlier").unwrap();
+
+    let output = fixture.run_with(&djvu, Some(&fixture.out), None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("DjVu: 2 pages"), "{stdout}");
+    assert!(stdout.contains("1 to transcribe, 1 already done"), "{stdout}");
+    let page = |name: &str| std::fs::read_to_string(fixture.out.join(name)).unwrap();
+    assert_eq!(page("1.md"), "done earlier");
+    assert_eq!(page("2.md"), "Fake transcription of 1 image(s).");
 }
