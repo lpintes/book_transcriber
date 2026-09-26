@@ -6,7 +6,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
-use crate::config::ResolvedModel;
+use crate::config::{Endpoint, ModelConfig, ResolvedModel};
 
 /// Token usage returned by the provider for one request.
 #[derive(Debug, Default, Clone, Copy)]
@@ -45,25 +45,63 @@ struct Attempt {
     retry_after: Option<Duration>,
 }
 
-pub struct Transcriber {
-    client: reqwest::blocking::Client,
+/// A way of sending a prompt plus page images to a model.
+pub trait Backend {
+    /// Send `prompt` plus every image to the model and return the cleaned text
+    /// response together with the reported token usage. Transient failures are
+    /// retried per `retry`.
+    fn transcribe(
+        &self,
+        prompt: &str,
+        images: &[&Path],
+        retry: RetryConfig,
+    ) -> Result<(String, Usage)>;
 }
 
-impl Transcriber {
-    pub fn new() -> Result<Self> {
+/// Create the backend matching the model's provider kind.
+pub fn backend_for(model: &ResolvedModel<'_>) -> Result<Box<dyn Backend + Sync>> {
+    match model.endpoint {
+        Endpoint::Openai { base_url, api_key } => {
+            Ok(Box::new(OpenAiBackend::new(model.model, base_url, api_key)?))
+        }
+        Endpoint::ClaudeCli => bail!(
+            "provider '{}' uses kind \"claude-cli\", which is not supported yet",
+            model.model.provider
+        ),
+    }
+}
+
+/// An OpenAI-compatible `/chat/completions` HTTP API.
+pub struct OpenAiBackend {
+    client: reqwest::blocking::Client,
+    url: String,
+    api_key: String,
+    model_id: String,
+    max_completion_tokens: u32,
+    reasoning_effort: Option<String>,
+}
+
+impl OpenAiBackend {
+    pub fn new(model: &ModelConfig, base_url: &str, api_key: &str) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
             .context("building HTTP client")?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            api_key: api_key.to_string(),
+            model_id: model.model_id.clone(),
+            max_completion_tokens: model.max_completion_tokens,
+            reasoning_effort: model.reasoning_effort.clone(),
+        })
     }
+}
 
-    /// Send `prompt` plus every image to the model and return the raw text
-    /// response together with the reported token usage. Transient failures are
-    /// retried with exponential backoff per `retry`.
-    pub fn transcribe(
+impl Backend for OpenAiBackend {
+    /// Transient failures are retried with exponential backoff per `retry`.
+    fn transcribe(
         &self,
-        model: &ResolvedModel<'_>,
         prompt: &str,
         images: &[&Path],
         retry: RetryConfig,
@@ -80,22 +118,17 @@ impl Transcriber {
         }
 
         let mut body = json!({
-            "model": model.model.model_id,
+            "model": self.model_id,
             "messages": [ { "role": "user", "content": content } ],
-            "max_completion_tokens": model.model.max_completion_tokens,
+            "max_completion_tokens": self.max_completion_tokens,
         });
-        if let Some(effort) = &model.model.reasoning_effort {
+        if let Some(effort) = &self.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
         }
 
-        let url = format!(
-            "{}/chat/completions",
-            model.provider.base_url.trim_end_matches('/')
-        );
-
         let mut attempt: u32 = 0;
         loop {
-            match self.try_once(&url, &model.provider.api_key, &body) {
+            match self.try_once(&body) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     if !err.retryable || attempt >= retry.max_retries {
@@ -118,13 +151,16 @@ impl Transcriber {
             }
         }
     }
+}
 
+impl OpenAiBackend {
     /// One HTTP attempt. Errors carry a retryable flag so the caller can decide.
-    fn try_once(&self, url: &str, api_key: &str, body: &Value) -> Result<(String, Usage), Attempt> {
+    fn try_once(&self, body: &Value) -> Result<(String, Usage), Attempt> {
+        let url = &self.url;
         let response = match self
             .client
             .post(url)
-            .bearer_auth(api_key)
+            .bearer_auth(&self.api_key)
             .json(body)
             .send()
         {

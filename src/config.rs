@@ -24,9 +24,32 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 pub struct Provider {
+    /// How requests are sent. Defaults to an OpenAI-compatible HTTP API.
+    #[serde(default)]
+    pub kind: ProviderKind,
     /// OpenAI-compatible base URL, e.g. `https://api.cerebras.ai/v1`.
-    pub base_url: String,
-    pub api_key: String,
+    /// Required for `kind = "openai"`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Required for `kind = "openai"`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    /// An OpenAI-compatible `/chat/completions` HTTP API.
+    #[default]
+    Openai,
+    /// The locally installed Claude Code CLI.
+    ClaudeCli,
+}
+
+/// Connection details of a provider, validated for its kind.
+pub enum Endpoint<'a> {
+    Openai { base_url: &'a str, api_key: &'a str },
+    ClaudeCli,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,7 +78,7 @@ fn default_max_completion_tokens() -> u32 {
 /// A model together with the provider it resolves to.
 pub struct ResolvedModel<'a> {
     pub model: &'a ModelConfig,
-    pub provider: &'a Provider,
+    pub endpoint: Endpoint<'a>,
 }
 
 impl Config {
@@ -87,6 +110,101 @@ impl Config {
                 model.provider
             )
         })?;
-        Ok(ResolvedModel { model, provider })
+        let endpoint = provider.endpoint(&model.provider)?;
+        Ok(ResolvedModel { model, endpoint })
+    }
+}
+
+impl Provider {
+    /// Check that the fields required by this provider's kind are present.
+    fn endpoint<'a>(&'a self, name: &str) -> Result<Endpoint<'a>> {
+        match self.kind {
+            ProviderKind::Openai => {
+                let base_url = self.base_url.as_deref().ok_or_else(|| {
+                    anyhow!("provider '{name}' is of kind \"openai\" but has no base_url")
+                })?;
+                let api_key = self.api_key.as_deref().ok_or_else(|| {
+                    anyhow!("provider '{name}' is of kind \"openai\" but has no api_key")
+                })?;
+                Ok(Endpoint::Openai { base_url, api_key })
+            }
+            ProviderKind::ClaudeCli => Ok(Endpoint::ClaudeCli),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example config from the README must keep working unchanged.
+    const README_EXAMPLE: &str = r#"
+default_model="qwen-3.8-27b"
+default_prompt="Hello! Please transcribe these pages to Markdown. Use LaTeX for math expressions and replace any diagrams or images with placeholder alt descriptions, containing the relevant information for the particular image or diagram."
+
+[providers]
+
+[providers.Cerebras]
+
+base_url="https://api.cerebras.ai/v1"
+api_key="..."
+
+[models]
+
+[models."qwen-3.8-27b"]
+
+provider="Cerebras"
+model_id="qwen-3.8-27b"
+"#;
+
+    #[test]
+    fn readme_example_is_an_openai_provider() {
+        let config: Config = toml::from_str(README_EXAMPLE).unwrap();
+        assert_eq!(config.providers["Cerebras"].kind, ProviderKind::Openai);
+        let resolved = config.resolve(None).unwrap();
+        assert_eq!(resolved.model.model_id, "qwen-3.8-27b");
+        assert_eq!(resolved.model.max_completion_tokens, 25_000);
+        assert!(resolved.model.reasoning_effort.is_none());
+        match resolved.endpoint {
+            Endpoint::Openai { base_url, api_key } => {
+                assert_eq!(base_url, "https://api.cerebras.ai/v1");
+                assert_eq!(api_key, "...");
+            }
+            Endpoint::ClaudeCli => panic!("expected an openai endpoint"),
+        }
+    }
+
+    #[test]
+    fn openai_provider_without_api_key_is_rejected() {
+        let config: Config = toml::from_str(
+            r#"
+default_model = "m"
+[providers.P]
+base_url = "https://example.com/v1"
+[models.m]
+provider = "P"
+model_id = "x"
+"#,
+        )
+        .unwrap();
+        let err = config.resolve(None).err().unwrap().to_string();
+        assert!(err.contains("'P'") && err.contains("api_key"), "{err}");
+    }
+
+    #[test]
+    fn claude_cli_provider_needs_no_url_or_key() {
+        let config: Config = toml::from_str(
+            r#"
+default_model = "claude-sonnet"
+[providers.ClaudeCLI]
+kind = "claude-cli"
+[models.claude-sonnet]
+provider = "ClaudeCLI"
+model_id = "sonnet"
+"#,
+        )
+        .unwrap();
+        let resolved = config.resolve(None).unwrap();
+        assert!(matches!(resolved.endpoint, Endpoint::ClaudeCli));
     }
 }

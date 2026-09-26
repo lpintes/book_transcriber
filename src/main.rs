@@ -18,7 +18,7 @@ use std::time::Duration;
 use config::Config;
 #[cfg(feature = "mupdf")]
 use pdf::Pdf;
-use transcriber::{RetryConfig, Transcriber, Usage};
+use transcriber::{RetryConfig, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
 const PAGE_BREAK: &str = "<<<--- PAGE BREAK --->>>";
@@ -185,7 +185,7 @@ or give an output directory to write one file per page",
         return Ok(());
     }
 
-    let transcriber = Transcriber::new()?;
+    let backend = transcriber::backend_for(&model)?;
     let retry = RetryConfig {
         max_retries: args.max_retries,
         base_delay: Duration::from_secs(2),
@@ -222,7 +222,7 @@ or give an output directory to write one file per page",
                     let batch_prompt = build_prompt(&prompt, batch.len());
                     let label = batch_label(batch);
 
-                    match transcriber.transcribe(&model, &batch_prompt, &paths, retry) {
+                    match backend.transcribe(&batch_prompt, &paths, retry) {
                         Ok((text, usage)) => {
                             prompt_tokens.fetch_add(usage.prompt_tokens, AtomicOrdering::Relaxed);
                             completion_tokens
