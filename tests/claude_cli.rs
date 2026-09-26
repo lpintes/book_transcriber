@@ -39,6 +39,8 @@ fn main() {
     println!("test not_logged_in_stops_the_run ... ok");
     missing_cli_is_reported_up_front();
     println!("test missing_cli_is_reported_up_front ... ok");
+    missing_input_is_a_usage_error();
+    println!("test missing_input_is_a_usage_error ... ok");
     if Command::new("pdftoppm").arg("-v").output().is_ok() {
         transcribes_a_pdf_with_diacritics_in_its_path();
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
@@ -305,6 +307,21 @@ fn missing_cli_is_reported_up_front() {
     // Nothing was created or attempted.
     assert!(!fixture.out.exists());
     assert!(!stderr.contains("failed:"), "{stderr}");
+}
+
+/// Without a terminal there is no setup wizard, so a missing input is the
+/// same usage error clap reported when the argument was required.
+fn missing_input_is_a_usage_error() {
+    let fixture = Fixture::new("no-input");
+    let output = Command::new(env!("CARGO_BIN_EXE_book_transcriber"))
+        .arg("--config")
+        .arg(fixture.root.join("missing.toml"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("<INPUT>"), "{stderr}");
+    assert!(stderr.contains("Usage:"), "{stderr}");
 }
 
 fn transcribes_a_pdf_with_diacritics_in_its_path() {

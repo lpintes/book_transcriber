@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 
 use std::time::Duration;
 
@@ -46,7 +47,9 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 struct Args {
     /// Input source: a directory of images (.png / .jpg / .jpeg), a .pdf file
     /// or a .djvu file.
-    input: PathBuf,
+    // Optional for clap only, so that a first run without arguments can still
+    // reach the setup wizard; `run` requires it right after that.
+    input: Option<PathBuf>,
 
     /// Output location. A directory writes one Markdown file per page (and a
     /// `prompt` file there, if present, is used as the user prompt). If omitted,
@@ -97,6 +100,15 @@ struct Args {
     dpi: Option<f32>,
 }
 
+impl Args {
+    /// The input path, which `run` checks for before anything uses it.
+    fn input(&self) -> &Path {
+        self.input
+            .as_deref()
+            .expect("input is checked at the start of run")
+    }
+}
+
 /// A temporary directory removed when this guard is dropped.
 struct TempDir {
     path: PathBuf,
@@ -140,12 +152,27 @@ fn run() -> Result<()> {
     };
     // Offer to create a missing config interactively; if the user skips it,
     // loading below reports the missing file as before.
+    let mut created_config = false;
     if !config_path.exists() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        wizard::run(
+        created_config = wizard::run(
             &mut std::io::stdin().lock(),
             &mut std::io::stdout(),
             &config_path,
         )?;
+    }
+    if args.input.is_none() {
+        if created_config {
+            println!(
+                "To transcribe a book, run btr again with its file or directory, e.g. btr book.pdf"
+            );
+            return Ok(());
+        }
+        Args::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "the following required argument was not provided: <INPUT>",
+            )
+            .exit();
     }
     let config = Config::load(&config_path)?;
     let model = config.resolve(args.model.as_deref())?;
@@ -154,11 +181,11 @@ fn run() -> Result<()> {
         bail!("DPI must be positive, got {dpi}");
     }
 
-    let document = DocumentKind::of(&args.input);
-    if document.is_none() && !args.input.is_dir() {
+    let document = DocumentKind::of(args.input());
+    if document.is_none() && !args.input().is_dir() {
         bail!(
             "input {} is neither a .pdf or .djvu file nor a directory",
-            args.input.display()
+            args.input().display()
         );
     }
 
@@ -176,7 +203,7 @@ fn run() -> Result<()> {
     // named after the input.
     let output = match &args.output {
         Some(dir) => Output::PerPage(dir.clone()),
-        None => Output::Single(combined_output_path(&args.input)?),
+        None => Output::Single(combined_output_path(args.input())?),
     };
     match &output {
         Output::PerPage(dir) => {
@@ -211,7 +238,7 @@ or give an output directory to write one file per page",
     let mut _tmp: Option<TempDir> = None;
     let pending = match document {
         Some(kind) => {
-            let doc = kind.open(&args.input)?;
+            let doc = kind.open(args.input())?;
             let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), kind.name(), dpi)?;
             _tmp = Some(tmp);
             pages
@@ -363,12 +390,12 @@ fn page_output(output: &Output, name: &str, overwrite: bool) -> (Option<PathBuf>
 
 /// Selected, not-yet-done pages from a directory of images (natural order).
 fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
-    let mut images = list_images(&args.input)?;
+    let mut images = list_images(args.input())?;
     images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
     if images.is_empty() {
         bail!(
             "no .png/.jpg/.jpeg images found in {}",
-            args.input.display()
+            args.input().display()
         );
     }
 
@@ -426,7 +453,7 @@ fn document_pages(
 ) -> Result<(Vec<Page>, TempDir)> {
     let total = doc.page_count()?;
     if total == 0 {
-        bail!("{kind} {} has no pages", args.input.display());
+        bail!("{kind} {} has no pages", args.input().display());
     }
 
     let start_idx = args.start - 1;
