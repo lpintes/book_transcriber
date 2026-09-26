@@ -36,8 +36,8 @@ Reproduce the text faithfully, preserving reading order, paragraphs, headings, \
 lists, and emphasis using Markdown. Do not add commentary, do not summarize, \
 and do not wrap your answer in a code fence. Output only the transcription.";
 
-/// Transcribe a directory of scanned book pages into Markdown using a
-/// vision-capable LLM.
+/// Transcribe scanned book pages (a PDF, a DjVu or a directory of images) into
+/// Markdown using a vision-capable LLM.
 #[derive(Parser, Debug)]
 // Plain text only: colored output reads poorly with a screen reader.
 #[command(version, about, color = clap::ColorChoice::Never)]
@@ -68,7 +68,8 @@ struct Args {
     #[arg(short, long)]
     model: Option<String>,
 
-    /// Path to the config file (default: ~/.config/book_transcriber/config.toml).
+    /// Path to the config file (default: ~/.config/book_transcriber/config.toml,
+    /// on Windows %APPDATA%\book_transcriber\config.toml).
     #[arg(long)]
     config: Option<PathBuf>,
 

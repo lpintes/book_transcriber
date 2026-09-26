@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 /// Top-level configuration, loaded from
-/// `~/.config/book_transcriber/config.toml`.
+/// `~/.config/book_transcriber/config.toml` (see `Config::default_path`).
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Name of the model (a key in `models`) used when `--model` is not given.
@@ -101,7 +101,8 @@ pub struct ResolvedModel<'a> {
 }
 
 impl Config {
-    /// `~/.config/book_transcriber/config.toml`
+    /// `~/.config/book_transcriber/config.toml`, on Windows
+    /// `%APPDATA%\book_transcriber\config.toml`.
     pub fn default_path() -> Result<PathBuf> {
         let dir = dirs::config_dir()
             .context("could not determine the user config directory (~/.config)")?;
