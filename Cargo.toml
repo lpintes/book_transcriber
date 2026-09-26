@@ -14,6 +14,11 @@ anyhow = "1"
 dirs = "5"
 mupdf = { version = "0.8.0", optional = true }
 
+[[test]]
+# Doubles as the fake `claude` program, so it provides its own main().
+name = "claude_cli"
+harness = false
+
 [features]
 # Render PDFs with a statically linked MuPDF (needs Clang and a C toolchain).
 mupdf = ["dep:mupdf"]

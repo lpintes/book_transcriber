@@ -6,14 +6,40 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 
-use crate::config::{Endpoint, ModelConfig, ResolvedModel};
+use crate::claude_cli::ClaudeCliBackend;
+use crate::config::{DEFAULT_MAX_COMPLETION_TOKENS, Endpoint, ModelConfig, ResolvedModel};
 
 /// Token usage returned by the provider for one request.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Cost estimate reported by the backend itself, if it reports one.
+    pub cost_usd: Option<f64>,
 }
+
+impl Usage {
+    pub fn add(&mut self, other: &Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        if let Some(cost) = other.cost_usd {
+            *self.cost_usd.get_or_insert(0.0) += cost;
+        }
+    }
+}
+
+/// An error that makes every remaining batch pointless (not logged in, usage
+/// limit reached, ...). The run stops instead of attempting further batches.
+#[derive(Debug)]
+pub struct Fatal(pub String);
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Fatal {}
 
 /// How to retry requests that fail with a transient error (network problems,
 /// rate limits, provider overload, 5xx).
@@ -37,7 +63,7 @@ impl Default for RetryConfig {
     }
 }
 
-/// A failed attempt, tagged with whether it is worth retrying and any
+/// A failed HTTP attempt, tagged with whether it is worth retrying and any
 /// server-provided `Retry-After` hint.
 struct Attempt {
     retryable: bool,
@@ -56,6 +82,9 @@ pub trait Backend {
         images: &[&Path],
         retry: RetryConfig,
     ) -> Result<(String, Usage)>;
+
+    /// How many requests to run in parallel when `--jobs` is not given.
+    fn default_jobs(&self) -> usize;
 }
 
 /// Create the backend matching the model's provider kind.
@@ -64,10 +93,25 @@ pub fn backend_for(model: &ResolvedModel<'_>) -> Result<Box<dyn Backend + Sync>>
         Endpoint::Openai { base_url, api_key } => {
             Ok(Box::new(OpenAiBackend::new(model.model, base_url, api_key)?))
         }
-        Endpoint::ClaudeCli => bail!(
-            "provider '{}' uses kind \"claude-cli\", which is not supported yet",
-            model.model.provider
-        ),
+        Endpoint::ClaudeCli {
+            command,
+            extra_args,
+        } => {
+            if model.model.reasoning_effort.is_some()
+                || model.model.max_completion_tokens.is_some()
+            {
+                eprintln!(
+                    "warning: model '{}' sets reasoning_effort or max_completion_tokens; \
+the claude-cli backend ignores them",
+                    model.name
+                );
+            }
+            Ok(Box::new(ClaudeCliBackend::new(
+                command,
+                extra_args,
+                &model.model.model_id,
+            )?))
+        }
     }
 }
 
@@ -92,7 +136,9 @@ impl OpenAiBackend {
             url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
             api_key: api_key.to_string(),
             model_id: model.model_id.clone(),
-            max_completion_tokens: model.max_completion_tokens,
+            max_completion_tokens: model
+                .max_completion_tokens
+                .unwrap_or(DEFAULT_MAX_COMPLETION_TOKENS),
             reasoning_effort: model.reasoning_effort.clone(),
         })
     }
@@ -150,6 +196,10 @@ impl Backend for OpenAiBackend {
                 }
             }
         }
+    }
+
+    fn default_jobs(&self) -> usize {
+        4
     }
 }
 
@@ -232,6 +282,7 @@ impl OpenAiBackend {
                 .pointer("/usage/completion_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            cost_usd: None,
         };
 
         Ok((clean_output(&message), usage))
@@ -240,7 +291,7 @@ impl OpenAiBackend {
 
 /// Exponential backoff with full jitter: a random wait in
 /// `[0, min(max_delay, base * 2^attempt)]`.
-fn backoff(attempt: u32, retry: &RetryConfig) -> Duration {
+pub(crate) fn backoff(attempt: u32, retry: &RetryConfig) -> Duration {
     let cap = retry.max_delay.as_secs_f64();
     let exp = retry.base_delay.as_secs_f64() * 2f64.powi(attempt as i32);
     let ceiling = exp.min(cap);
@@ -271,7 +322,7 @@ fn parse_retry_after(response: &reqwest::blocking::Response) -> Option<Duration>
         .map(Duration::from_secs)
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= max {
         s.to_string()
@@ -283,6 +334,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Read an image file and return a `data:` URL with base64 payload.
 fn encode_image(path: &Path) -> Result<String> {
+    let (mime, data) = read_image_base64(path)?;
+    Ok(format!("data:{mime};base64,{data}"))
+}
+
+/// Read an image file and return its MIME type and base64-encoded contents.
+pub(crate) fn read_image_base64(path: &Path) -> Result<(&'static str, String)> {
     let mime = match path
         .extension()
         .and_then(|e| e.to_str())
@@ -294,12 +351,12 @@ fn encode_image(path: &Path) -> Result<String> {
         other => bail!("unsupported image extension: {other:?}"),
     };
     let bytes = std::fs::read(path).with_context(|| format!("reading image {}", path.display()))?;
-    Ok(format!("data:{mime};base64,{}", BASE64.encode(bytes)))
+    Ok((mime, BASE64.encode(bytes)))
 }
 
 /// Strip reasoning-model artifacts: `<think>` blocks and a single wrapping
 /// markdown code fence, so what we write is the transcription itself.
-fn clean_output(raw: &str) -> String {
+pub(crate) fn clean_output(raw: &str) -> String {
     let mut text = raw.to_string();
 
     // Remove <think>...</think> blocks (some reasoning models emit them).

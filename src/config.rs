@@ -34,6 +34,12 @@ pub struct Provider {
     /// Required for `kind = "openai"`.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Program to run for `kind = "claude-cli"`; defaults to `claude` from PATH.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Extra arguments passed to the CLI for `kind = "claude-cli"`.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -48,9 +54,18 @@ pub enum ProviderKind {
 
 /// Connection details of a provider, validated for its kind.
 pub enum Endpoint<'a> {
-    Openai { base_url: &'a str, api_key: &'a str },
-    ClaudeCli,
+    Openai {
+        base_url: &'a str,
+        api_key: &'a str,
+    },
+    ClaudeCli {
+        command: &'a str,
+        extra_args: &'a [String],
+    },
 }
+
+/// Used when a model does not set `max_completion_tokens`.
+pub const DEFAULT_MAX_COMPLETION_TOKENS: u32 = 25_000;
 
 #[derive(Debug, Deserialize)]
 pub struct ModelConfig {
@@ -61,9 +76,10 @@ pub struct ModelConfig {
     /// Optional reasoning effort ("low"/"medium"/"high"). Omit for none.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// Upper bound on tokens the model may generate per request.
-    #[serde(default = "default_max_completion_tokens")]
-    pub max_completion_tokens: u32,
+    /// Upper bound on tokens the model may generate per request
+    /// (default: `DEFAULT_MAX_COMPLETION_TOKENS`).
+    #[serde(default)]
+    pub max_completion_tokens: Option<u32>,
     /// Optional pricing, USD per 1M tokens, used only for cost reporting.
     #[serde(default)]
     pub input_price_per_mtok: Option<f64>,
@@ -71,12 +87,10 @@ pub struct ModelConfig {
     pub output_price_per_mtok: Option<f64>,
 }
 
-fn default_max_completion_tokens() -> u32 {
-    25_000
-}
-
 /// A model together with the provider it resolves to.
 pub struct ResolvedModel<'a> {
+    /// The model's key in `models`.
+    pub name: &'a str,
     pub model: &'a ModelConfig,
     pub endpoint: Endpoint<'a>,
 }
@@ -100,9 +114,9 @@ impl Config {
     /// Resolve a model by name (or the default) together with its provider.
     pub fn resolve<'a>(&'a self, name: Option<&str>) -> Result<ResolvedModel<'a>> {
         let name = name.unwrap_or(&self.default_model);
-        let model = self
+        let (name, model) = self
             .models
-            .get(name)
+            .get_key_value(name)
             .ok_or_else(|| anyhow!("model '{name}' is not defined in [models]"))?;
         let provider = self.providers.get(&model.provider).ok_or_else(|| {
             anyhow!(
@@ -111,7 +125,11 @@ impl Config {
             )
         })?;
         let endpoint = provider.endpoint(&model.provider)?;
-        Ok(ResolvedModel { model, endpoint })
+        Ok(ResolvedModel {
+            name,
+            model,
+            endpoint,
+        })
     }
 }
 
@@ -128,7 +146,10 @@ impl Provider {
                 })?;
                 Ok(Endpoint::Openai { base_url, api_key })
             }
-            ProviderKind::ClaudeCli => Ok(Endpoint::ClaudeCli),
+            ProviderKind::ClaudeCli => Ok(Endpoint::ClaudeCli {
+                command: self.command.as_deref().unwrap_or("claude"),
+                extra_args: &self.extra_args,
+            }),
         }
     }
 }
@@ -163,14 +184,15 @@ model_id="qwen-3.8-27b"
         assert_eq!(config.providers["Cerebras"].kind, ProviderKind::Openai);
         let resolved = config.resolve(None).unwrap();
         assert_eq!(resolved.model.model_id, "qwen-3.8-27b");
-        assert_eq!(resolved.model.max_completion_tokens, 25_000);
+        assert_eq!(resolved.name, "qwen-3.8-27b");
+        assert!(resolved.model.max_completion_tokens.is_none());
         assert!(resolved.model.reasoning_effort.is_none());
         match resolved.endpoint {
             Endpoint::Openai { base_url, api_key } => {
                 assert_eq!(base_url, "https://api.cerebras.ai/v1");
                 assert_eq!(api_key, "...");
             }
-            Endpoint::ClaudeCli => panic!("expected an openai endpoint"),
+            Endpoint::ClaudeCli { .. } => panic!("expected an openai endpoint"),
         }
     }
 
@@ -205,6 +227,15 @@ model_id = "sonnet"
         )
         .unwrap();
         let resolved = config.resolve(None).unwrap();
-        assert!(matches!(resolved.endpoint, Endpoint::ClaudeCli));
+        match resolved.endpoint {
+            Endpoint::ClaudeCli {
+                command,
+                extra_args,
+            } => {
+                assert_eq!(command, "claude");
+                assert!(extra_args.is_empty());
+            }
+            Endpoint::Openai { .. } => panic!("expected a claude-cli endpoint"),
+        }
     }
 }

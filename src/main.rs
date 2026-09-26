@@ -1,3 +1,4 @@
+mod claude_cli;
 mod config;
 #[cfg(feature = "mupdf")]
 mod pdf;
@@ -7,7 +8,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +19,7 @@ use std::time::Duration;
 use config::Config;
 #[cfg(feature = "mupdf")]
 use pdf::Pdf;
-use transcriber::{RetryConfig, Usage};
+use transcriber::{Fatal, RetryConfig, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
 const PAGE_BREAK: &str = "<<<--- PAGE BREAK --->>>";
@@ -73,9 +74,10 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     max_retries: u32,
 
-    /// Number of requests to run in parallel.
-    #[arg(short, long, default_value_t = 4)]
-    jobs: usize,
+    /// Number of requests to run in parallel (default: 4 for HTTP providers,
+    /// 1 for claude-cli).
+    #[arg(short, long)]
+    jobs: Option<usize>,
 
     /// Resolution to render PDF pages at (PDF input only). Lower values hurt
     /// OCR quality; ~200-300 is a good range.
@@ -157,10 +159,9 @@ or give an output directory to write one file per page",
     };
     let prompt = load_prompt(prompt_dir, config.default_prompt.as_deref())?;
 
-    let model_name = args.model.as_deref().unwrap_or(&config.default_model);
     println!(
-        "Model: {model_name} ({} via {})",
-        model.model.model_id, model.model.provider
+        "Model: {} ({} via {})",
+        model.name, model.model.model_id, model.model.provider
     );
 
     // Build the list of pages to transcribe from either a PDF or an image dir.
@@ -194,7 +195,8 @@ or give an output directory to write one file per page",
 
     let batches: Vec<&[Page]> = pending.chunks(args.batch_size).collect();
     let total_batches = batches.len();
-    let workers = args.jobs.max(1).min(total_batches);
+    let jobs = args.jobs.unwrap_or_else(|| backend.default_jobs());
+    let workers = jobs.max(1).min(total_batches);
     if workers > 1 {
         println!("Running {workers} requests in parallel.");
     }
@@ -202,8 +204,8 @@ or give an output directory to write one file per page",
     // Shared state for the worker pool.
     let next = AtomicUsize::new(0); // index of the next batch to claim
     let done = AtomicUsize::new(0); // completed batches, for progress display
-    let prompt_tokens = AtomicU64::new(0);
-    let completion_tokens = AtomicU64::new(0);
+    let stop = AtomicBool::new(false); // set after a fatal error
+    let total = Mutex::new(Usage::default());
     let print_lock = Mutex::new(()); // serializes multi-line console output
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
     // Single-file mode buffers (order, text) here for ordered assembly.
@@ -213,6 +215,9 @@ or give an output directory to write one file per page",
         for _ in 0..workers {
             scope.spawn(|| {
                 loop {
+                    if stop.load(AtomicOrdering::Relaxed) {
+                        break;
+                    }
                     let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
                     if idx >= total_batches {
                         break;
@@ -224,9 +229,7 @@ or give an output directory to write one file per page",
 
                     match backend.transcribe(&batch_prompt, &paths, retry) {
                         Ok((text, usage)) => {
-                            prompt_tokens.fetch_add(usage.prompt_tokens, AtomicOrdering::Relaxed);
-                            completion_tokens
-                                .fetch_add(usage.completion_tokens, AtomicOrdering::Relaxed);
+                            total.lock().unwrap().add(&usage);
                             let split = split_batch(batch, &text);
                             let summary = deliver(&output, batch, split, &collected);
                             let n = done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
@@ -240,6 +243,9 @@ or give an output directory to write one file per page",
                             }
                         }
                         Err(e) => {
+                            if e.downcast_ref::<Fatal>().is_some() {
+                                stop.store(true, AtomicOrdering::Relaxed);
+                            }
                             let _lock = print_lock.lock().unwrap();
                             eprintln!("{label}: failed: {e:#}");
                             failures.lock().unwrap().push(format!("{label}: {e:#}"));
@@ -250,11 +256,7 @@ or give an output directory to write one file per page",
         }
     });
 
-    let total = Usage {
-        prompt_tokens: prompt_tokens.into_inner(),
-        completion_tokens: completion_tokens.into_inner(),
-    };
-    report_usage(&total, &model);
+    report_usage(&total.into_inner().unwrap(), &model);
 
     // In single-file mode, assemble the collected pages in order and write once.
     if let Output::Single(path) = &output {
@@ -266,6 +268,13 @@ or give an output directory to write one file per page",
         eprintln!("\n{} batch(es) failed:", failures.len());
         for f in &failures {
             eprintln!("  {f}");
+        }
+        let started = next.into_inner().min(total_batches);
+        if started < total_batches {
+            eprintln!(
+                "Stopped after a fatal error; {} batch(es) were not attempted.",
+                total_batches - started
+            );
         }
         eprintln!("Re-run to retry the failed pages (already-done pages are skipped).");
         bail!("{} batch(es) failed", failures.len());
@@ -640,6 +649,12 @@ fn report_usage(total: &Usage, model: &config::ResolvedModel<'_>) {
         let cost = total.prompt_tokens as f64 / 1e6 * in_price.unwrap_or(0.0)
             + total.completion_tokens as f64 / 1e6 * out_price.unwrap_or(0.0);
         println!("  estimated cost:     ${cost:.4}");
+    }
+    if let Some(cost) = total.cost_usd {
+        println!(
+            "  reported cost:      ${cost:.4} (the backend's own estimate; \
+with a subscription this is only indicative)"
+        );
     }
 }
 
