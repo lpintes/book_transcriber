@@ -12,7 +12,7 @@ This project is 100% coded by Claude. I'm just lightly skimming through the outp
 
 ### An example config file
 
-Since this is a project using large language models, you first need to configure the providers and models to be used. Create a config.toml in ~/.config/book_transcriber (on Windows, `%APPDATA%\book_transcriber\config.toml`, e.g. `C:\Users\<name>\AppData\Roaming\book_transcriber\config.toml`) and give it the following content, replacing the services, models and instructions according to your needs. A config file elsewhere can be selected with `--config`.
+Since this is a project using large language models, you first need to configure the providers and models to be used. Create a config.toml in ~/.config/book_transcriber (on Windows, `%APPDATA%\book_transcriber\config.toml`, e.g. `C:\Users\<name>\AppData\Roaming\book_transcriber\config.toml`) and give it the following content, replacing the services, models and instructions according to your needs. A config file elsewhere can be selected with `--config`. When the config file doesn't exist and btr runs in a terminal, it offers to create a minimal one by asking a few questions; answer `s` to skip.
 
 ```
 default_model="qwen-3.8-27b"

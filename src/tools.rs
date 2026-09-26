@@ -78,7 +78,7 @@ pub fn check(requirements: &[Requirement]) -> Result<()> {
 
 /// Whether `program` can be started: a path to an existing file, or a bare
 /// name found in one of the PATH directories.
-fn is_installed(program: &str) -> bool {
+pub fn is_installed(program: &str) -> bool {
     let path = Path::new(program);
     if path.components().count() > 1 {
         return is_program_file(path);

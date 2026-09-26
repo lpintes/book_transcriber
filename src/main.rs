@@ -5,9 +5,11 @@ mod pages;
 mod pdf;
 mod tools;
 mod transcriber;
+mod wizard;
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -136,6 +138,15 @@ fn run() -> Result<()> {
         Some(p) => p.clone(),
         None => Config::default_path()?,
     };
+    // Offer to create a missing config interactively; if the user skips it,
+    // loading below reports the missing file as before.
+    if !config_path.exists() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        wizard::run(
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+            &config_path,
+        )?;
+    }
     let config = Config::load(&config_path)?;
     let model = config.resolve(args.model.as_deref())?;
     let dpi = args.dpi.or(model.model.dpi).unwrap_or(DEFAULT_DPI);
