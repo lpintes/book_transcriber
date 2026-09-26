@@ -1,4 +1,5 @@
 mod config;
+#[cfg(feature = "mupdf")]
 mod pdf;
 mod transcriber;
 
@@ -15,6 +16,7 @@ use clap::Parser;
 use std::time::Duration;
 
 use config::Config;
+#[cfg(feature = "mupdf")]
 use pdf::Pdf;
 use transcriber::{RetryConfig, Transcriber, Usage};
 
@@ -87,6 +89,8 @@ struct TempDir {
 }
 
 impl TempDir {
+    // Only PDF rendering needs a temp dir, and that is feature-gated for now.
+    #[cfg_attr(not(feature = "mupdf"), allow(dead_code))]
     fn new() -> Result<Self> {
         let path = std::env::temp_dir().join(format!("book_transcriber-{}", std::process::id()));
         std::fs::create_dir_all(&path)
@@ -368,9 +372,16 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
     Ok(pending)
 }
 
+/// PDF rendering is unavailable without the `mupdf` feature.
+#[cfg(not(feature = "mupdf"))]
+fn pdf_pages(_args: &Args, _output: &Output) -> Result<(Vec<Page>, TempDir)> {
+    bail!("PDF input requires building with `--features mupdf`")
+}
+
 /// Selected, not-yet-done pages from a PDF. Each pending page is rendered to a
 /// PNG in a temp directory (returned so it outlives transcription); in per-page
 /// mode output files are named by page number (e.g. `3.md`).
+#[cfg(feature = "mupdf")]
 fn pdf_pages(args: &Args, output: &Output) -> Result<(Vec<Page>, TempDir)> {
     let doc = Pdf::open(&args.input)?;
     let total = doc.page_count()? as usize;

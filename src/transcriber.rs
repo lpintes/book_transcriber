@@ -280,12 +280,12 @@ fn clean_output(raw: &str) -> String {
 
     // Unwrap a single fenced block that spans the whole response, e.g.
     // ```markdown\n...\n``` .
-    if trimmed.starts_with("```") {
-        if let Some(first_newline) = trimmed.find('\n') {
-            let after_fence = &trimmed[first_newline + 1..];
-            if let Some(close) = after_fence.rfind("```") {
-                return after_fence[..close].trim_end().to_string();
-            }
+    if trimmed.starts_with("```")
+        && let Some(first_newline) = trimmed.find('\n')
+    {
+        let after_fence = &trimmed[first_newline + 1..];
+        if let Some(close) = after_fence.rfind("```") {
+            return after_fence[..close].trim_end().to_string();
         }
     }
 
