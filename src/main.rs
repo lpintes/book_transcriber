@@ -46,7 +46,8 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 #[command(version, about, color = clap::ColorChoice::Never)]
 struct Args {
     /// Input source: a directory of images (.png / .jpg / .jpeg), a .pdf file
-    /// or a .djvu file.
+    /// or a .djvu file. A prompt file named after it (e.g. `book.prompt` next to
+    /// `book.pdf`), if present, is used as the user prompt.
     // Optional for clap only, so that a first run without arguments can still
     // reach the setup wizard; `run` requires it right after that.
     input: Option<PathBuf>,
@@ -225,12 +226,14 @@ or give an output directory to write one file per page",
         Output::PerPage(dir) => Some(dir.as_path()),
         Output::Single(_) => None,
     };
-    let prompt = load_prompt(prompt_dir, config.default_prompt.as_deref())?;
+    let (prompt, prompt_source) =
+        load_prompt(prompt_dir, args.input(), config.default_prompt.as_deref())?;
 
     println!(
         "Model: {} ({} via {})",
         model.name, model.model.model_id, model.model.provider
     );
+    println!("Prompt: {prompt_source}");
 
     // Build the list of pages to transcribe from a PDF, a DjVu or an image dir.
     // For a document, rendered page images live in `_tmp`, kept alive until the run
@@ -502,15 +505,22 @@ fn document_pages(
     Ok((pending, tmp))
 }
 
+/// A file next to the input, named after it with extension `ext`:
+/// `document.pdf` -> `document.<ext>`, directory `mybook/` -> `mybook.<ext>`.
+fn sibling_path(input: &Path, ext: &str) -> Option<PathBuf> {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())?;
+    let parent = input.parent().unwrap_or_else(|| Path::new(""));
+    Some(parent.join(format!("{stem}.{ext}")))
+}
+
 /// Derive the single-file output path from the input: `document.pdf` ->
 /// `document.md`, directory `mybook/` -> `mybook.md`, placed next to the input.
 fn combined_output_path(input: &Path) -> Result<PathBuf> {
-    let stem = match input.file_stem().and_then(|s| s.to_str()) {
-        Some(s) if !s.is_empty() => s,
-        _ => bail!("cannot derive an output file name from {}", input.display()),
-    };
-    let parent = input.parent().unwrap_or_else(|| Path::new(""));
-    Ok(parent.join(format!("{stem}.md")))
+    sibling_path(input, "md")
+        .with_context(|| format!("cannot derive an output file name from {}", input.display()))
 }
 
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -531,20 +541,34 @@ fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Resolve the prompt: a `prompt` file in the per-page output directory
-/// overrides everything, then the config's `default_prompt`, then the built-in
-/// default. `prompt_dir` is `None` in single-file mode (no directory to hold a
-/// prompt file), so only the config/built-in defaults apply there.
-fn load_prompt(prompt_dir: Option<&Path>, config_default: Option<&str>) -> Result<String> {
-    if let Some(dir) = prompt_dir {
-        let prompt_file = dir.join("prompt");
-        if prompt_file.exists() {
-            let text = std::fs::read_to_string(&prompt_file)
-                .with_context(|| format!("reading prompt file {}", prompt_file.display()))?;
-            return Ok(text.trim().to_string());
+/// Resolve the prompt, returning it with a description of where it came from.
+/// The first that exists wins: a `prompt` file in the per-page output directory
+/// (`prompt_dir`, `None` in single-file mode), a `<input name>.prompt` file next
+/// to the input (e.g. `book.prompt` beside `book.pdf`), the config's
+/// `default_prompt`, and the built-in default.
+fn load_prompt(
+    prompt_dir: Option<&Path>,
+    input: &Path,
+    config_default: Option<&str>,
+) -> Result<(String, String)> {
+    let files = prompt_dir
+        .map(|dir| dir.join("prompt"))
+        .into_iter()
+        .chain(sibling_path(input, "prompt"));
+    for file in files {
+        if file.is_file() {
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("reading prompt file {}", file.display()))?;
+            return Ok((text.trim().to_string(), format!("file {}", file.display())));
         }
     }
-    Ok(config_default.unwrap_or(DEFAULT_PROMPT).to_string())
+    Ok(match config_default {
+        Some(text) => (
+            text.to_string(),
+            String::from("default_prompt from the config"),
+        ),
+        None => (DEFAULT_PROMPT.to_string(), String::from("built-in default")),
+    })
 }
 
 /// Augment the base prompt with page-delimiter instructions for batches > 1.
@@ -761,4 +785,68 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
         }
     }
     a.len().cmp(&b.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A temp dir holding `Kniha – časť 1.pdf` and an output directory `out`.
+    fn book_dir(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "book_transcriber-prompt-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let input = dir.join("Kniha – časť 1.pdf");
+        std::fs::write(&input, b"%PDF").unwrap();
+        (dir, input, out)
+    }
+
+    #[test]
+    fn sibling_path_follows_the_input_name() {
+        assert_eq!(
+            sibling_path(Path::new("dir/book.pdf"), "prompt"),
+            Some(PathBuf::from("dir/book.prompt"))
+        );
+        assert_eq!(
+            sibling_path(Path::new("dir/pages/"), "md"),
+            Some(PathBuf::from("dir/pages.md"))
+        );
+        assert_eq!(sibling_path(Path::new(".."), "md"), None);
+    }
+
+    #[test]
+    fn prompt_sources_in_order() {
+        let (dir, input, out) = book_dir("order");
+        let load = |prompt_dir: Option<&Path>, config: Option<&str>| {
+            load_prompt(prompt_dir, &input, config).unwrap()
+        };
+
+        let (text, source) = load(Some(&out), None);
+        assert_eq!(text, DEFAULT_PROMPT);
+        assert_eq!(source, "built-in default");
+
+        let (text, source) = load(Some(&out), Some("from config"));
+        assert_eq!(text, "from config");
+        assert_eq!(source, "default_prompt from the config");
+
+        let book_prompt = dir.join("Kniha – časť 1.prompt");
+        std::fs::write(&book_prompt, "from the book\n").unwrap();
+        let (text, source) = load(Some(&out), Some("from config"));
+        assert_eq!(text, "from the book");
+        assert_eq!(source, format!("file {}", book_prompt.display()));
+        // Single-file mode has no output directory but still finds it.
+        assert_eq!(load(None, Some("from config")).0, "from the book");
+
+        std::fs::write(out.join("prompt"), "from the output directory").unwrap();
+        assert_eq!(
+            load(Some(&out), Some("from config")).0,
+            "from the output directory"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

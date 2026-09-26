@@ -90,7 +90,9 @@ DjVu files work the same way as PDFs.
 btr book_pages output_directory
 ```
 
-Reads images from directory book_pages and saves transcriptions into output_directory. If output_directory contains a plain-text file called prompt, this prompt is used for the transcription.
+Reads images from directory book_pages and saves transcriptions into output_directory.
+
+Instructions for a particular book, e.g. to use LaTeX for math or to put footnotes at the end of the page, go into a plain-text prompt file named after the input: `book.prompt` next to `book.pdf`, or `book_pages.prompt` next to the directory book_pages. The prompt is taken from the first of these that exists: a file called prompt in the output directory, the prompt file next to the input, `default_prompt` from the config, and a built-in prompt asking for a faithful Markdown transcription. btr prints which one it uses.
 
 ```sh
 btr -s 120 -n 10 book.pdf output_directory
