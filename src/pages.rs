@@ -95,12 +95,8 @@ impl PageSource for Poppler {
     fn page_count(&self) -> Result<usize> {
         let output = run_tool(Command::new("pdfinfo").arg(&self.path), "pdfinfo")?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_pdfinfo_pages(&stdout).with_context(|| {
-            format!(
-                "pdfinfo reported no page count for {}",
-                self.path.display()
-            )
-        })
+        parse_pdfinfo_pages(&stdout)
+            .with_context(|| format!("pdfinfo reported no page count for {}", self.path.display()))
     }
 
     fn render_png(&self, page: usize, dpi: f32, dest: &Path) -> Result<()> {

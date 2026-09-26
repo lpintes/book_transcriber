@@ -43,7 +43,9 @@ fn main() {
         transcribes_a_pdf_with_diacritics_in_its_path();
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
     } else {
-        println!("test transcribes_a_pdf_with_diacritics_in_its_path ... skipped (Poppler is not installed)");
+        println!(
+            "test transcribes_a_pdf_with_diacritics_in_its_path ... skipped (Poppler is not installed)"
+        );
     }
     if Command::new("ddjvu").arg("--help").output().is_ok() {
         transcribes_remaining_djvu_pages();
@@ -94,7 +96,12 @@ fn check_request(args: &[String]) -> Result<usize, String> {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str)
     };
-    for flag in ["-p", "--verbose", "--strict-mcp-config", "--no-session-persistence"] {
+    for flag in [
+        "-p",
+        "--verbose",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+    ] {
         if !has_flag(flag) {
             return Err(format!("missing {flag} in {args:?}"));
         }
@@ -271,7 +278,10 @@ fn not_logged_in_stops_the_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "btr should fail\n{stderr}");
     assert!(stderr.contains("log in"), "{stderr}");
-    assert!(stderr.contains("1 batch(es) were not attempted"), "{stderr}");
+    assert!(
+        stderr.contains("1 batch(es) were not attempted"),
+        "{stderr}"
+    );
     assert!(!fixture.out.join("1.md").exists());
 }
 
@@ -335,7 +345,10 @@ fn transcribes_remaining_djvu_pages() {
         "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("DjVu: 2 pages"), "{stdout}");
-    assert!(stdout.contains("1 to transcribe, 1 already done"), "{stdout}");
+    assert!(
+        stdout.contains("1 to transcribe, 1 already done"),
+        "{stdout}"
+    );
     let page = |name: &str| std::fs::read_to_string(fixture.out.join(name)).unwrap();
     assert_eq!(page("1.md"), "done earlier");
     assert_eq!(page("2.md"), "Fake transcription of 1 image(s).");

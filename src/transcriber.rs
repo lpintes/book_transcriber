@@ -90,15 +90,16 @@ pub trait Backend {
 /// Create the backend matching the model's provider kind.
 pub fn backend_for(model: &ResolvedModel<'_>) -> Result<Box<dyn Backend + Sync>> {
     match model.endpoint {
-        Endpoint::Openai { base_url, api_key } => {
-            Ok(Box::new(OpenAiBackend::new(model.model, base_url, api_key)?))
-        }
+        Endpoint::Openai { base_url, api_key } => Ok(Box::new(OpenAiBackend::new(
+            model.model,
+            base_url,
+            api_key,
+        )?)),
         Endpoint::ClaudeCli {
             command,
             extra_args,
         } => {
-            if model.model.reasoning_effort.is_some()
-                || model.model.max_completion_tokens.is_some()
+            if model.model.reasoning_effort.is_some() || model.model.max_completion_tokens.is_some()
             {
                 eprintln!(
                     "warning: model '{}' sets reasoning_effort or max_completion_tokens; \

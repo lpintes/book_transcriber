@@ -152,8 +152,10 @@ fn run() -> Result<()> {
     }
 
     // Report missing external programs before creating or rendering anything.
-    let mut requirements: Vec<Requirement> =
-        document.and_then(DocumentKind::requirement).into_iter().collect();
+    let mut requirements: Vec<Requirement> = document
+        .and_then(DocumentKind::requirement)
+        .into_iter()
+        .collect();
     if let Endpoint::ClaudeCli { command, .. } = model.endpoint {
         requirements.push(Requirement::claude_cli(command));
     }
@@ -353,7 +355,10 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
     let mut images = list_images(&args.input)?;
     images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
     if images.is_empty() {
-        bail!("no .png/.jpg/.jpeg images found in {}", args.input.display());
+        bail!(
+            "no .png/.jpg/.jpeg images found in {}",
+            args.input.display()
+        );
     }
 
     let start_idx = args.start - 1;
@@ -637,7 +642,9 @@ fn write_combined(path: &Path, pending: &[Page], collected: Vec<(usize, String)>
     std::fs::write(path, &doc).with_context(|| format!("writing {}", path.display()))?;
     println!("\nWrote {} ({} pages).", path.display(), pending.len());
     if missing > 0 {
-        eprintln!("Note: {missing} page(s) failed and are marked with placeholders in the document.");
+        eprintln!(
+            "Note: {missing} page(s) failed and are marked with placeholders in the document."
+        );
     }
     Ok(())
 }
