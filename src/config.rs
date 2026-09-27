@@ -85,6 +85,10 @@ pub struct ModelConfig {
     /// smaller renders.
     #[serde(default)]
     pub dpi: Option<f32>,
+    /// Number of requests to run in parallel for this model; `--jobs`
+    /// overrides it. Default: the backend's own (see `Backend::default_jobs`).
+    #[serde(default)]
+    pub jobs: Option<usize>,
     /// Optional pricing, USD per 1M tokens, used only for cost reporting.
     #[serde(default)]
     pub input_price_per_mtok: Option<f64>,
@@ -193,6 +197,7 @@ model_id="qwen-3.8-27b"
         assert_eq!(resolved.name, "qwen-3.8-27b");
         assert!(resolved.model.max_completion_tokens.is_none());
         assert!(resolved.model.reasoning_effort.is_none());
+        assert!(resolved.model.jobs.is_none());
         match resolved.endpoint {
             Endpoint::Openai { base_url, api_key } => {
                 assert_eq!(base_url, "https://api.cerebras.ai/v1");
@@ -229,10 +234,12 @@ kind = "claude-cli"
 [models.claude-sonnet]
 provider = "ClaudeCLI"
 model_id = "sonnet"
+jobs = 3
 "#,
         )
         .unwrap();
         let resolved = config.resolve(None).unwrap();
+        assert_eq!(resolved.model.jobs, Some(3));
         match resolved.endpoint {
             Endpoint::ClaudeCli {
                 command,

@@ -91,8 +91,8 @@ struct Args {
     #[arg(long, default_value_t = 5)]
     max_retries: u32,
 
-    /// Number of requests to run in parallel (default: 4 for HTTP providers,
-    /// 1 for claude-cli).
+    /// Number of requests to run in parallel. Default: the model's `jobs` from
+    /// the config, else 4 for HTTP providers and 1 for claude-cli.
     #[arg(short, long)]
     jobs: Option<usize>,
 
@@ -255,7 +255,10 @@ or give an output directory to write one file per page",
 
     let batches: Vec<&[Page]> = pending.chunks(args.batch_size).collect();
     let total_batches = batches.len();
-    let jobs = args.jobs.unwrap_or_else(|| backend.default_jobs());
+    let jobs = args
+        .jobs
+        .or(model.model.jobs)
+        .unwrap_or_else(|| backend.default_jobs());
     let workers = jobs.max(1).min(total_batches);
     if workers > 1 {
         println!("Running {workers} requests in parallel.");

@@ -33,7 +33,7 @@ provider="Cerebras"
 model_id="qwen-3.8-27b"
 ```
 
-Any OpenAI-compatible `/chat/completions` API works this way. Optional model settings are `reasoning_effort`, `max_completion_tokens` (default 25000), `dpi` (see below) and `input_price_per_mtok` / `output_price_per_mtok` for a cost estimate.
+Any OpenAI-compatible `/chat/completions` API works this way. Optional model settings are `reasoning_effort`, `max_completion_tokens` (default 25000), `dpi` (see below), `jobs` (how many requests run in parallel, default 4; `--jobs` overrides it) and `input_price_per_mtok` / `output_price_per_mtok` for a cost estimate.
 
 ### Using a Claude subscription through Claude Code
 
@@ -49,13 +49,14 @@ kind="claude-cli"
 provider="ClaudeCLI"
 model_id="sonnet"       # an alias (sonnet, opus, ...) or a full model ID
 dpi=150
+# jobs=3                # optional, requests in parallel; default 1
 ```
 
 Then `btr -m claude-sonnet book.pdf` (or set `default_model="claude-sonnet"`). Run `claude` once beforehand and log in.
 
 Things worth knowing about this backend:
 
-- A subscription has usage limits instead of a price per token. Requests therefore run one at a time unless you pass `--jobs`. When a limit is reached and the CLI reports when it resets, btr stops and tells you how long to wait; run the same command again later and finished pages are skipped.
+- A subscription has usage limits instead of a price per token. Requests run one at a time unless the model sets `jobs` or you pass `--jobs`. Running several at once uses the same amount of the limit, only sooner: a long book done one page at a time may stretch over several usage windows, while in parallel the same work lands in fewer of them. When a limit is reached and the CLI reports when it resets, btr stops and tells you how long to wait; run the same command again later and finished pages are skipped.
 - The token usage is reported as usual. The CLI also reports a cost in USD, which btr prints, but with a subscription that figure is only indicative.
 - Every batch runs as a fresh `claude -p` process in an empty temporary directory, with all tools, MCP servers, user and project settings and session history disabled. The model only sees the prompt and the page images.
 - `reasoning_effort` and `max_completion_tokens` don't apply and are ignored with a warning.

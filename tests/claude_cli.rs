@@ -36,6 +36,8 @@ fn main() {
 
     transcribes_pages_through_the_cli();
     println!("test transcribes_pages_through_the_cli ... ok");
+    jobs_from_the_config_run_in_parallel();
+    println!("test jobs_from_the_config_run_in_parallel ... ok");
     unsplit_batch_is_retried_one_page_at_a_time();
     println!("test unsplit_batch_is_retried_one_page_at_a_time ... ok");
     refused_batch_is_retried_one_page_at_a_time();
@@ -293,6 +295,30 @@ fn transcribes_pages_through_the_cli() {
     assert!(stdout.contains("input tokens: 246"), "{stdout}");
     assert!(stdout.contains("output tokens: 14"), "{stdout}");
     assert!(stdout.contains("reported cost: $0.0200"), "{stdout}");
+}
+
+fn jobs_from_the_config_run_in_parallel() {
+    let fixture = Fixture::new("jobs");
+    // The model's section is the last one in the config.
+    let mut config = std::fs::read_to_string(&fixture.config).unwrap();
+    config.push_str("jobs = 2\n");
+    std::fs::write(&fixture.config, config).unwrap();
+
+    let output = fixture.run(None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Running 2 requests in parallel."),
+        "{stdout}"
+    );
+    for page in ["1.md", "2.md"] {
+        let text = std::fs::read_to_string(fixture.out.join(page)).unwrap();
+        assert_eq!(text, "Fake transcription of 1 image(s).");
+    }
 }
 
 fn unsplit_batch_is_retried_one_page_at_a_time() {
