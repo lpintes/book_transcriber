@@ -20,7 +20,9 @@ const NOT_LOGGED_IN: &str = include_str!("fixtures/claude_cli/not_logged_in.json
 const BLANK_PDF: &[u8] = include_bytes!("fixtures/blank-2-pages.pdf");
 const RED_DJVU: &[u8] = include_bytes!("fixtures/blank-2-pages.djvu");
 
-/// Selects the fake's behavior; unset means success.
+/// Selects the fake's behavior; unset means success. Without a mode, a request
+/// with several images gets one answer without page breaks, which btr can't
+/// split into pages.
 const MODE_VAR: &str = "FAKE_CLAUDE_MODE";
 /// The book's directory, which the CLI must not run in.
 const BOOK_DIR_VAR: &str = "FAKE_CLAUDE_BOOK_DIR";
@@ -34,6 +36,10 @@ fn main() {
 
     transcribes_pages_through_the_cli();
     println!("test transcribes_pages_through_the_cli ... ok");
+    unsplit_batch_is_retried_one_page_at_a_time();
+    println!("test unsplit_batch_is_retried_one_page_at_a_time ... ok");
+    refused_batch_is_retried_one_page_at_a_time();
+    println!("test refused_batch_is_retried_one_page_at_a_time ... ok");
     not_logged_in_stops_the_run();
     println!("test not_logged_in_stops_the_run ... ok");
     missing_cli_is_reported_up_front();
@@ -65,7 +71,14 @@ fn fake_claude(args: &[String]) {
         print!("{NOT_LOGGED_IN}");
         std::process::exit(1);
     }
+    let refuse_batches = std::env::var(MODE_VAR).as_deref() == Ok("refuse_batches");
     match check_request(args) {
+        Ok(images) if refuse_batches && images > 1 => {
+            let result = json!({"type": "result", "subtype": "success", "is_error": true,
+                "result": "fake claude: refused"});
+            println!("{result}");
+            std::process::exit(1);
+        }
         Ok(images) => {
             let text = format!("Fake transcription of {images} image(s).");
             let lines = [
@@ -280,6 +293,48 @@ fn transcribes_pages_through_the_cli() {
     assert!(stdout.contains("input tokens: 246"), "{stdout}");
     assert!(stdout.contains("output tokens: 14"), "{stdout}");
     assert!(stdout.contains("reported cost: $0.0200"), "{stdout}");
+}
+
+fn unsplit_batch_is_retried_one_page_at_a_time() {
+    let fixture = Fixture::new("unsplit");
+    let output = fixture.run_with(&fixture.book, Some(&fixture.out), &["-b", "2"], None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("could not split 2 pages"), "{stdout}");
+    for page in ["1.md", "2.md"] {
+        let text = std::fs::read_to_string(fixture.out.join(page)).unwrap();
+        assert_eq!(text, "Fake transcription of 1 image(s).");
+    }
+    // Every page has its own file, so the raw response is gone.
+    assert!(!fixture.out.join("1-2.raw.md").exists());
+}
+
+fn refused_batch_is_retried_one_page_at_a_time() {
+    let fixture = Fixture::new("refused");
+    let output = fixture.run_with(
+        &fixture.book,
+        Some(&fixture.out),
+        &["-b", "2"],
+        Some("refuse_batches"),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("trying the pages one at a time"),
+        "{stdout}"
+    );
+    for page in ["1.md", "2.md"] {
+        let text = std::fs::read_to_string(fixture.out.join(page)).unwrap();
+        assert_eq!(text, "Fake transcription of 1 image(s).");
+    }
 }
 
 fn not_logged_in_stops_the_run() {

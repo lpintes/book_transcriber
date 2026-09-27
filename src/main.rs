@@ -24,7 +24,7 @@ use std::time::Duration;
 use config::{Config, Endpoint};
 use pages::{DocumentKind, PageSource};
 use tools::Requirement;
-use transcriber::{Fatal, RetryConfig, Usage};
+use transcriber::{Backend, Fatal, RetryConfig, Usage};
 
 /// Marker the model is asked to place between pages in a multi-image batch.
 const PAGE_BREAK: &str = "<<<--- PAGE BREAK --->>>";
@@ -269,6 +269,17 @@ or give an output directory to write one file per page",
     let total = Mutex::new(Usage::default());
     let print_lock = Mutex::new(()); // serializes multi-line console output
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let job = Job {
+        backend: backend.as_ref(),
+        prompt: &prompt,
+        retry,
+        dir: &output.dir,
+        total: &total,
+        done: &done,
+        total_batches,
+        print_lock: &print_lock,
+        failures: &failures,
+    };
     // How many pending pages have their image ready, in order.
     let ready = Mutex::new(0usize);
     let ready_changed = Condvar::new();
@@ -304,34 +315,9 @@ or give an output directory to write one file per page",
                         break;
                     }
 
-                    let paths: Vec<&Path> = batch.iter().map(|p| p.image.as_path()).collect();
-                    let batch_prompt = build_prompt(&prompt, batch.len());
-                    let label = batch_label(batch);
-
                     attempted.fetch_add(1, AtomicOrdering::Relaxed);
-                    match backend.transcribe(&batch_prompt, &paths, retry) {
-                        Ok((text, usage)) => {
-                            total.lock().unwrap().add(&usage);
-                            let split = split_batch(batch, &text);
-                            let summary = deliver(&output.dir, batch, split);
-                            let n = done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-                            let _lock = print_lock.lock().unwrap();
-                            match summary {
-                                Ok(s) => println!("[{n}/{total_batches}] {label}: {s}"),
-                                Err(e) => {
-                                    eprintln!("[{n}/{total_batches}] {label}: write failed: {e:#}");
-                                    failures.lock().unwrap().push(format!("{label}: {e:#}"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if e.downcast_ref::<Fatal>().is_some() {
-                                halt();
-                            }
-                            let _lock = print_lock.lock().unwrap();
-                            eprintln!("{label}: failed: {e:#}");
-                            failures.lock().unwrap().push(format!("{label}: {e:#}"));
-                        }
+                    if job.run(batch, true) {
+                        halt();
                     }
                 }
             });
@@ -703,35 +689,128 @@ fn split_batch<'a>(batch: &'a [Page], text: &str) -> BatchSplit<'a> {
     }
 }
 
-/// Write the pages of one batch into `dir`, returning a short human-readable
-/// summary.
-fn deliver(dir: &Path, batch: &[Page], split: BatchSplit) -> Result<String> {
-    match split {
-        BatchSplit::Pages(pairs) => {
-            let mut names = Vec::with_capacity(pairs.len());
-            for (page, text) in &pairs {
-                std::fs::write(&page.output, text)
-                    .with_context(|| format!("writing {}", page.output.display()))?;
-                names.push(file_name(&page.output));
+/// What the workers share to transcribe batches and report on them.
+struct Job<'a> {
+    backend: &'a (dyn Backend + Sync),
+    prompt: &'a str,
+    retry: RetryConfig,
+    /// Where page files and raw responses are written.
+    dir: &'a Path,
+    total: &'a Mutex<Usage>,
+    /// Completed batches, for progress display.
+    done: &'a AtomicUsize,
+    total_batches: usize,
+    /// Serializes multi-line console output.
+    print_lock: &'a Mutex<()>,
+    failures: &'a Mutex<Vec<String>>,
+}
+
+impl Job<'_> {
+    /// Transcribe `batch` and write its pages. When a batch of several pages
+    /// fails (e.g. a content filter refuses one of them) or its response can't
+    /// be split into pages, the pages are tried again one at a time. `counted`
+    /// batches are the ones in the progress count; retried pages are reported
+    /// indented below theirs. Returns true after a fatal error.
+    fn run(&self, batch: &[Page], counted: bool) -> bool {
+        let label = batch_label(batch);
+        let paths: Vec<&Path> = batch.iter().map(|p| p.image.as_path()).collect();
+        let batch_prompt = build_prompt(self.prompt, batch.len());
+        match self.backend.transcribe(&batch_prompt, &paths, self.retry) {
+            Ok((text, usage)) => {
+                self.total.lock().unwrap().add(&usage);
+                match split_batch(batch, &text) {
+                    BatchSplit::Pages(pairs) => {
+                        match write_pages(&pairs) {
+                            Ok(summary) => self.report(counted, &format!("{label}: {summary}")),
+                            Err(e) => {
+                                self.report(counted, &format!("{label}: write failed: {e:#}"));
+                                self.fail(format!("{label}: {e:#}"));
+                            }
+                        }
+                        false
+                    }
+                    BatchSplit::Unsplit(raw) => {
+                        // Keep the raw response until every page has its own
+                        // file, so nothing is lost if the retries fail too.
+                        let raw_path = self.dir.join(raw_name(batch));
+                        let saved = std::fs::write(&raw_path, &raw);
+                        let note = match &saved {
+                            Ok(()) => format!("kept in {}", file_name(&raw_path)),
+                            Err(e) => format!("could not keep it: {e}"),
+                        };
+                        self.report(
+                            counted,
+                            &format!(
+                                "{label}: could not split {} pages ({note}); \
+trying them one at a time",
+                                batch.len()
+                            ),
+                        );
+                        let fatal = self.one_at_a_time(batch);
+                        if saved.is_ok() && batch.iter().all(|page| page.output.exists()) {
+                            let _ = std::fs::remove_file(&raw_path);
+                        }
+                        fatal
+                    }
+                }
             }
-            Ok(format!("wrote {}", names.join(", ")))
-        }
-        BatchSplit::Unsplit(raw) => {
-            // Don't guess a split; dump the raw response so nothing is lost.
-            let name = format!(
-                "{}-{}.raw.md",
-                file_stem(&batch[0].image),
-                file_stem(&batch[batch.len() - 1].image)
-            );
-            let path = dir.join(&name);
-            std::fs::write(&path, &raw).with_context(|| format!("writing {}", path.display()))?;
-            Ok(format!(
-                "could not split {} pages; wrote raw response to {name} \
-(re-run these pages with --batch-size 1)",
-                batch.len()
-            ))
+            Err(e) if e.downcast_ref::<Fatal>().is_none() && batch.len() > 1 => {
+                self.report(
+                    counted,
+                    &format!("{label}: failed: {e:#}; trying the pages one at a time"),
+                );
+                self.one_at_a_time(batch)
+            }
+            Err(e) => {
+                let _lock = self.print_lock.lock().unwrap();
+                eprintln!("{}{label}: failed: {e:#}", if counted { "" } else { "  " });
+                self.fail(format!("{label}: {e:#}"));
+                e.downcast_ref::<Fatal>().is_some()
+            }
         }
     }
+
+    /// Transcribe each page of `batch` on its own; stops after a fatal error.
+    fn one_at_a_time(&self, batch: &[Page]) -> bool {
+        batch.chunks(1).any(|page| self.run(page, false))
+    }
+
+    /// Print one progress line: numbered for a counted batch, indented for a
+    /// page retried on its own.
+    fn report(&self, counted: bool, line: &str) {
+        let _lock = self.print_lock.lock().unwrap();
+        if counted {
+            let n = self.done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            println!("[{n}/{}] {line}", self.total_batches);
+        } else {
+            println!("  {line}");
+        }
+    }
+
+    fn fail(&self, failure: String) {
+        self.failures.lock().unwrap().push(failure);
+    }
+}
+
+/// Write one file per page, returning a short human-readable summary.
+fn write_pages(pairs: &[(&Page, String)]) -> Result<String> {
+    let mut names = Vec::with_capacity(pairs.len());
+    for (page, text) in pairs {
+        std::fs::write(&page.output, text)
+            .with_context(|| format!("writing {}", page.output.display()))?;
+        names.push(file_name(&page.output));
+    }
+    Ok(format!("wrote {}", names.join(", ")))
+}
+
+/// The file a batch's unsplit response is kept in, e.g. `12-16.raw.md`, as
+/// `raw_responses` expects.
+fn raw_name(batch: &[Page]) -> String {
+    format!(
+        "{}-{}.raw.md",
+        file_stem(&batch[0].image),
+        file_stem(&batch[batch.len() - 1].image)
+    )
 }
 
 /// Combine the page files in `dir` into one document at `path`, in the order
