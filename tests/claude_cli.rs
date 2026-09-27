@@ -40,6 +40,8 @@ fn main() {
     println!("test missing_cli_is_reported_up_front ... ok");
     missing_input_is_a_usage_error();
     println!("test missing_input_is_a_usage_error ... ok");
+    single_file_mode_resumes_from_the_work_directory();
+    println!("test single_file_mode_resumes_from_the_work_directory ... ok");
     if Command::new("pdftoppm").arg("-v").output().is_ok() {
         transcribes_a_pdf_with_diacritics_in_its_path();
         println!("test transcribes_a_pdf_with_diacritics_in_its_path ... ok");
@@ -220,10 +222,16 @@ impl Fixture {
 
     /// Transcribe the image directory into the per-page output directory.
     fn run(&self, mode: Option<&str>) -> Output {
-        self.run_with(&self.book, Some(&self.out), mode)
+        self.run_with(&self.book, Some(&self.out), &[], mode)
     }
 
-    fn run_with(&self, input: &Path, output: Option<&Path>, mode: Option<&str>) -> Output {
+    fn run_with(
+        &self,
+        input: &Path,
+        output: Option<&Path>,
+        extra: &[&str],
+        mode: Option<&str>,
+    ) -> Output {
         let book_dir = if input.is_dir() {
             input
         } else {
@@ -234,7 +242,8 @@ impl Fixture {
         if let Some(output) = output {
             cmd.arg(output);
         }
-        cmd.arg("--config")
+        cmd.args(extra)
+            .arg("--config")
             .arg(&self.config)
             .env(BOOK_DIR_VAR, book_dir)
             .env_remove(MODE_VAR);
@@ -329,7 +338,7 @@ fn transcribes_a_pdf_with_diacritics_in_its_path() {
     std::fs::write(&pdf, BLANK_PDF).unwrap();
 
     // No output argument: both pages go into one file next to the PDF.
-    let output = fixture.run_with(&pdf, None, None);
+    let output = fixture.run_with(&pdf, None, &[], None);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -340,6 +349,54 @@ fn transcribes_a_pdf_with_diacritics_in_its_path() {
     let text = std::fs::read_to_string(fixture.root.join("Kniha – časť 1.md")).unwrap();
     assert_eq!(
         text,
+        "Fake transcription of 1 image(s).\n\nFake transcription of 1 image(s)."
+    );
+    // The pages are also kept one per file in the work directory.
+    assert!(
+        fixture
+            .root
+            .join("Kniha – časť 1.btr")
+            .join("2.md")
+            .is_file()
+    );
+}
+
+fn single_file_mode_resumes_from_the_work_directory() {
+    let fixture = Fixture::new("single-file");
+    let combined = fixture.root.join("book.md");
+    let run = |extra: &[&str]| {
+        let output = fixture.run_with(&fixture.book, None, extra, None);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.success(), stdout, stderr)
+    };
+
+    // A file from elsewhere, without a work directory, is left alone.
+    std::fs::write(&combined, "not btr's").unwrap();
+    let (success, _, stderr) = run(&[]);
+    assert!(!success, "btr should fail\n{stderr}");
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&combined).unwrap(), "not btr's");
+    std::fs::remove_file(&combined).unwrap();
+
+    let (success, stdout, stderr) = run(&["-n", "1"]);
+    assert!(success, "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stdout.contains("1 of 2 pages transcribed"), "{stdout}");
+    assert!(stdout.contains("Not transcribed: 2.png"), "{stdout}");
+    assert_eq!(
+        std::fs::read_to_string(&combined).unwrap(),
+        "Fake transcription of 1 image(s).\n\n<!-- 2.png: not transcribed -->"
+    );
+
+    // The next run transcribes only the rest and regenerates the file.
+    let (success, stdout, stderr) = run(&[]);
+    assert!(success, "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains("1 to transcribe, 1 already done"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&combined).unwrap(),
         "Fake transcription of 1 image(s).\n\nFake transcription of 1 image(s)."
     );
 }
@@ -353,7 +410,7 @@ fn transcribes_remaining_djvu_pages() {
     std::fs::create_dir_all(&fixture.out).unwrap();
     std::fs::write(fixture.out.join("1.md"), "done earlier").unwrap();
 
-    let output = fixture.run_with(&djvu, Some(&fixture.out), None);
+    let output = fixture.run_with(&djvu, Some(&fixture.out), &[], None);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

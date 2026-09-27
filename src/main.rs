@@ -54,8 +54,10 @@ struct Args {
 
     /// Output location. A directory writes one Markdown file per page (and a
     /// `prompt` file there, if present, is used as the user prompt). If omitted,
-    /// all pages are combined into a single file named after the input
-    /// (e.g. `document.pdf` -> `document.md`), written next to it.
+    /// the pages go into a work directory named after the input (e.g.
+    /// `document.pdf` -> `document.btr`), so an interrupted run can be resumed,
+    /// and all transcribed pages are combined into a single file next to the
+    /// input (`document.md`).
     output: Option<PathBuf>,
 
     /// How many images to send to the model in a single request.
@@ -200,57 +202,68 @@ fn run() -> Result<()> {
     }
     tools::check(&requirements)?;
 
-    // Directory output => one file per page; no output => a single combined file
-    // named after the input.
+    // Directory output => one file per page; no output => one file per page in a
+    // work directory, combined into a single file named after the input.
     let output = match &args.output {
-        Some(dir) => Output::PerPage(dir.clone()),
-        None => Output::Single(combined_output_path(args.input())?),
-    };
-    match &output {
-        Output::PerPage(dir) => {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating output directory {}", dir.display()))?;
-        }
-        Output::Single(path) => {
-            if path.exists() && !args.overwrite {
+        Some(dir) => Output {
+            dir: dir.clone(),
+            combined: None,
+        },
+        None => {
+            let combined = combined_output_path(args.input())?;
+            let dir = work_dir_path(args.input())?;
+            // Without a work directory the file is not btr's to regenerate.
+            if combined.exists() && !dir.exists() && !args.overwrite {
                 bail!(
                     "output file {} already exists; pass --overwrite to replace it, \
 or give an output directory to write one file per page",
-                    path.display()
+                    combined.display()
                 );
             }
+            Output {
+                dir,
+                combined: Some(combined),
+            }
         }
-    }
-
-    let prompt_dir = match &output {
-        Output::PerPage(dir) => Some(dir.as_path()),
-        Output::Single(_) => None,
     };
-    let (prompt, prompt_source) =
-        load_prompt(prompt_dir, args.input(), config.default_prompt.as_deref())?;
+    std::fs::create_dir_all(&output.dir)
+        .with_context(|| format!("creating output directory {}", output.dir.display()))?;
+
+    let (prompt, prompt_source) = load_prompt(
+        args.output.as_deref(),
+        args.input(),
+        config.default_prompt.as_deref(),
+    )?;
 
     println!(
         "Model: {} ({} via {})",
         model.name, model.model.model_id, model.model.provider
     );
     println!("Prompt: {prompt_source}");
+    if output.combined.is_some() {
+        println!("Work directory: {}", output.dir.display());
+    }
 
     // Build the list of pages to transcribe from a PDF, a DjVu or an image dir.
     // For a document, rendered page images live in `_tmp`, kept alive until the run
     // finishes.
     let mut _tmp: Option<TempDir> = None;
-    let pending = match document {
+    let (pending, all) = match document {
         Some(kind) => {
             let doc = kind.open(args.input())?;
-            let (pages, tmp) = document_pages(&args, &output, doc.as_ref(), kind.name(), dpi)?;
+            let (pages, all, tmp) =
+                document_pages(&args, &output.dir, doc.as_ref(), kind.name(), dpi)?;
             _tmp = Some(tmp);
-            pages
+            (pages, all)
         }
-        None => image_dir_pages(&args, &output)?,
+        None => image_dir_pages(&args, &output.dir)?,
     };
 
     if pending.is_empty() {
-        println!("Nothing to do.");
+        println!("Nothing to transcribe.");
+        if let Some(path) = &output.combined {
+            write_combined(path, &output.dir, &all)?;
+        }
         return Ok(());
     }
 
@@ -276,8 +289,6 @@ or give an output directory to write one file per page",
     let total = Mutex::new(Usage::default());
     let print_lock = Mutex::new(()); // serializes multi-line console output
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    // Single-file mode buffers (order, text) here for ordered assembly.
-    let collected: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -299,7 +310,7 @@ or give an output directory to write one file per page",
                         Ok((text, usage)) => {
                             total.lock().unwrap().add(&usage);
                             let split = split_batch(batch, &text);
-                            let summary = deliver(&output, batch, split, &collected);
+                            let summary = deliver(&output.dir, batch, split);
                             let n = done.fetch_add(1, AtomicOrdering::Relaxed) + 1;
                             let _lock = print_lock.lock().unwrap();
                             match summary {
@@ -326,9 +337,10 @@ or give an output directory to write one file per page",
 
     report_usage(&total.into_inner().unwrap(), &model);
 
-    // In single-file mode, assemble the collected pages in order and write once.
-    if let Output::Single(path) = &output {
-        write_combined(path, &pending, collected.into_inner().unwrap())?;
+    // In single-file mode, combine everything transcribed so far, including
+    // pages from earlier runs.
+    if let Some(path) = &output.combined {
+        write_combined(path, &output.dir, &all)?;
     }
 
     let failures = failures.into_inner().unwrap();
@@ -351,11 +363,20 @@ or give an output directory to write one file per page",
 }
 
 /// Where transcriptions go.
-enum Output {
-    /// One Markdown file per page, written into this directory.
-    PerPage(PathBuf),
-    /// All pages combined into this single Markdown file.
-    Single(PathBuf),
+struct Output {
+    /// One Markdown file per page is written here: the output directory, or in
+    /// single-file mode the work directory next to the input.
+    dir: PathBuf,
+    /// In single-file mode, the file all transcribed pages are combined into.
+    combined: Option<PathBuf>,
+}
+
+/// One page of the input, whether selected for this run or not.
+struct Entry {
+    /// Name of its transcription file without `.md` (e.g. `12`).
+    name: String,
+    /// Human-readable name for messages (e.g. `12.png` or `page 3`).
+    label: String,
 }
 
 /// One page to transcribe.
@@ -364,10 +385,8 @@ struct Page {
     image: PathBuf,
     /// Human-readable name for progress output (e.g. `12.png` or `page 3`).
     label: String,
-    /// Position in the selected sequence; used to reassemble single-file output.
-    order: usize,
-    /// Destination file in per-page mode; `None` in single-file mode.
-    output: Option<PathBuf>,
+    /// Destination file.
+    output: PathBuf,
 }
 
 fn file_name(path: &Path) -> String {
@@ -377,22 +396,17 @@ fn file_name(path: &Path) -> String {
         .to_string()
 }
 
-/// The destination file for one page in per-page mode, or `None` in single-file
-/// mode. Returns `None` via the `skip` flag when the file already exists and
-/// resume is active (per-page mode only).
-fn page_output(output: &Output, name: &str, overwrite: bool) -> (Option<PathBuf>, bool) {
-    match output {
-        Output::PerPage(dir) => {
-            let path = dir.join(format!("{name}.md"));
-            let skip = !overwrite && path.exists();
-            (Some(path), skip)
-        }
-        Output::Single(_) => (None, false),
-    }
+/// The destination file for one page, and whether to skip the page because
+/// the file already exists and resume is active.
+fn page_output(dir: &Path, name: &str, overwrite: bool) -> (PathBuf, bool) {
+    let path = dir.join(format!("{name}.md"));
+    let skip = !overwrite && path.exists();
+    (path, skip)
 }
 
-/// Selected, not-yet-done pages from a directory of images (natural order).
-fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
+/// Selected, not-yet-done pages from a directory of images (natural order),
+/// and all the images as entries.
+fn image_dir_pages(args: &Args, dir: &Path) -> Result<(Vec<Page>, Vec<Entry>)> {
     let mut images = list_images(args.input())?;
     images.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
     if images.is_empty() {
@@ -417,9 +431,8 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
 
     let mut pending = Vec::new();
     let mut skipped = 0usize;
-    for (order, img) in images[start_idx..end_idx].iter().enumerate() {
-        let stem = img.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
-        let (out, skip) = page_output(output, stem, args.overwrite);
+    for img in &images[start_idx..end_idx] {
+        let (out, skip) = page_output(dir, &file_stem(img), args.overwrite);
         if skip {
             skipped += 1;
             continue;
@@ -427,10 +440,16 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
         pending.push(Page {
             image: img.clone(),
             label: file_name(img),
-            order,
             output: out,
         });
     }
+    let all = images
+        .iter()
+        .map(|img| Entry {
+            name: file_stem(img),
+            label: file_name(img),
+        })
+        .collect();
 
     println!(
         "Pages {} to {} of {} selected; {} to transcribe, {} already done.",
@@ -440,20 +459,20 @@ fn image_dir_pages(args: &Args, output: &Output) -> Result<Vec<Page>> {
         pending.len(),
         skipped
     );
-    Ok(pending)
+    Ok((pending, all))
 }
 
 /// Selected, not-yet-done pages from a paged document such as a PDF (`kind`
-/// names it in messages). Each pending page is rendered to a PNG in a temp
-/// directory (returned so it outlives transcription); in per-page mode output
-/// files are named by page number (e.g. `3.md`).
+/// names it in messages), and all its pages as entries. Each pending page is
+/// rendered to a PNG in a temp directory (returned so it outlives
+/// transcription); output files are named by page number (e.g. `3.md`).
 fn document_pages(
     args: &Args,
-    output: &Output,
+    dir: &Path,
     doc: &dyn PageSource,
     kind: &str,
     dpi: f32,
-) -> Result<(Vec<Page>, TempDir)> {
+) -> Result<(Vec<Page>, Vec<Entry>, TempDir)> {
     let total = doc.page_count()?;
     if total == 0 {
         bail!("{kind} {} has no pages", args.input().display());
@@ -478,10 +497,10 @@ fn document_pages(
     let tmp = TempDir::new()?;
     let mut pending = Vec::new();
     let mut skipped = 0usize;
-    for (order, page) in (args.start..=end).enumerate() {
+    for page in args.start..=end {
         // `page` is the 1-based page number the user sees.
         let name = page.to_string();
-        let (out, skip) = page_output(output, &name, args.overwrite);
+        let (out, skip) = page_output(dir, &name, args.overwrite);
         if skip {
             skipped += 1;
             continue;
@@ -492,17 +511,22 @@ fn document_pages(
         pending.push(Page {
             image,
             label: format!("page {page}"),
-            order,
             output: out,
         });
     }
+    let all = (1..=total)
+        .map(|page| Entry {
+            name: page.to_string(),
+            label: format!("page {page}"),
+        })
+        .collect();
 
     println!(
         "Pages {} to {end} selected; {} to transcribe, {skipped} already done.",
         args.start,
         pending.len()
     );
-    Ok((pending, tmp))
+    Ok((pending, all, tmp))
 }
 
 /// A file next to the input, named after it with extension `ext`:
@@ -521,6 +545,17 @@ fn sibling_path(input: &Path, ext: &str) -> Option<PathBuf> {
 fn combined_output_path(input: &Path) -> Result<PathBuf> {
     sibling_path(input, "md")
         .with_context(|| format!("cannot derive an output file name from {}", input.display()))
+}
+
+/// Derive the single-file work directory from the input: `document.pdf` ->
+/// `document.btr`, placed next to it.
+fn work_dir_path(input: &Path) -> Result<PathBuf> {
+    sibling_path(input, "btr").with_context(|| {
+        format!(
+            "cannot derive a work directory name from {}",
+            input.display()
+        )
+    })
 }
 
 fn list_images(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -587,9 +622,17 @@ the last one."
 
 fn batch_label(batch: &[Page]) -> String {
     match (batch.first(), batch.last()) {
-        (Some(first), _) if batch.len() == 1 => first.label.clone(),
-        (Some(first), Some(last)) => format!("{} to {}", first.label, last.label),
+        (Some(first), Some(last)) => range_label(&first.label, &last.label),
         _ => String::from("(empty)"),
+    }
+}
+
+/// `page 3`, or `page 3 to page 5` for a range of pages.
+fn range_label(first: &str, last: &str) -> String {
+    if first == last {
+        first.to_string()
+    } else {
+        format!("{first} to {last}")
     }
 }
 
@@ -622,93 +665,166 @@ fn split_batch<'a>(batch: &'a [Page], text: &str) -> BatchSplit<'a> {
     }
 }
 
-/// Write (per-page mode) or buffer (single-file mode) the pages of one batch,
-/// returning a short human-readable summary.
-fn deliver(
-    output: &Output,
-    batch: &[Page],
-    split: BatchSplit,
-    collected: &Mutex<Vec<(usize, String)>>,
-) -> Result<String> {
-    match output {
-        Output::PerPage(dir) => match split {
-            BatchSplit::Pages(pairs) => {
-                let mut names = Vec::with_capacity(pairs.len());
-                for (page, text) in &pairs {
-                    let path = page.output.as_ref().expect("per-page mode has a path");
-                    std::fs::write(path, text)
-                        .with_context(|| format!("writing {}", path.display()))?;
-                    names.push(file_name(path));
-                }
-                Ok(format!("wrote {}", names.join(", ")))
+/// Write the pages of one batch into `dir`, returning a short human-readable
+/// summary.
+fn deliver(dir: &Path, batch: &[Page], split: BatchSplit) -> Result<String> {
+    match split {
+        BatchSplit::Pages(pairs) => {
+            let mut names = Vec::with_capacity(pairs.len());
+            for (page, text) in &pairs {
+                std::fs::write(&page.output, text)
+                    .with_context(|| format!("writing {}", page.output.display()))?;
+                names.push(file_name(&page.output));
             }
-            BatchSplit::Unsplit(raw) => {
-                // Don't guess a split; dump the raw response so nothing is lost.
-                let name = format!(
-                    "{}-{}.raw.md",
-                    file_stem(&batch[0].image),
-                    file_stem(&batch[batch.len() - 1].image)
-                );
-                let path = dir.join(&name);
-                std::fs::write(&path, &raw)
-                    .with_context(|| format!("writing {}", path.display()))?;
-                Ok(format!(
-                    "could not split {} pages; wrote raw response to {name} \
+            Ok(format!("wrote {}", names.join(", ")))
+        }
+        BatchSplit::Unsplit(raw) => {
+            // Don't guess a split; dump the raw response so nothing is lost.
+            let name = format!(
+                "{}-{}.raw.md",
+                file_stem(&batch[0].image),
+                file_stem(&batch[batch.len() - 1].image)
+            );
+            let path = dir.join(&name);
+            std::fs::write(&path, &raw).with_context(|| format!("writing {}", path.display()))?;
+            Ok(format!(
+                "could not split {} pages; wrote raw response to {name} \
 (re-run these pages with --batch-size 1)",
-                    batch.len()
-                ))
-            }
-        },
-        Output::Single(_) => {
-            let mut buf = collected.lock().unwrap();
-            match split {
-                BatchSplit::Pages(pairs) => {
-                    let labels: Vec<&str> = pairs.iter().map(|(p, _)| p.label.as_str()).collect();
-                    let summary = format!("transcribed {}", labels.join(", "));
-                    for (page, text) in pairs {
-                        buf.push((page.order, text));
-                    }
-                    Ok(summary)
-                }
-                BatchSplit::Unsplit(raw) => {
-                    // Keep the whole response as one block at the batch's start.
-                    buf.push((batch[0].order, raw));
-                    Ok(format!(
-                        "could not split {} pages; kept as one block \
-(re-run with --batch-size 1)",
-                        batch.len()
-                    ))
-                }
-            }
+                batch.len()
+            ))
         }
     }
 }
 
-/// Assemble the buffered single-file pages in page order and write the combined
-/// document. Pages that failed leave a visible placeholder rather than a silent
-/// gap.
-fn write_combined(path: &Path, pending: &[Page], collected: Vec<(usize, String)>) -> Result<()> {
-    let texts: HashMap<usize, String> = collected.into_iter().collect();
-    let mut sections = Vec::with_capacity(pending.len());
-    let mut missing = 0usize;
-    for page in pending {
-        match texts.get(&page.order) {
-            Some(text) => sections.push(text.clone()),
-            None => {
-                missing += 1;
-                sections.push(format!("<!-- {}: transcription failed -->", page.label));
-            }
+/// Combine the page files in `dir` into one document at `path`, in the order
+/// of `all`. A raw response that could not be split stands in for its pages
+/// while none of them has a file of its own. Each other run of pages without a
+/// file (not transcribed yet or failed) becomes one placeholder line rather
+/// than a silent gap.
+fn write_combined(path: &Path, dir: &Path, all: &[Entry]) -> Result<()> {
+    let mut texts = Vec::with_capacity(all.len());
+    for entry in all {
+        let file = dir.join(format!("{}.md", entry.name));
+        texts.push(read_if_exists(&file)?);
+    }
+    let raws = raw_responses(dir, all, &texts)?;
+
+    let mut sections = Vec::new();
+    let mut gaps = Vec::new();
+    let mut unsplit = Vec::new();
+    let mut gap: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < all.len() {
+        if let Some(text) = &texts[i] {
+            close_gap(gap.take(), all, &mut gaps, &mut sections);
+            sections.push(text.clone());
+            i += 1;
+        } else if let Some(raw) = raws.iter().find(|raw| raw.first == i) {
+            close_gap(gap.take(), all, &mut gaps, &mut sections);
+            let label = range_label(&all[raw.first].label, &all[raw.last].label);
+            sections.push(format!(
+                "<!-- {label}: not split into pages -->\n\n{}",
+                raw.text
+            ));
+            unsplit.push(label);
+            i = raw.last + 1;
+        } else {
+            gap = Some((gap.map_or(i, |(first, _)| first), i));
+            i += 1;
         }
     }
+    close_gap(gap, all, &mut gaps, &mut sections);
+
     let doc = sections.join("\n\n");
     std::fs::write(path, &doc).with_context(|| format!("writing {}", path.display()))?;
-    println!("\nWrote {} ({} pages).", path.display(), pending.len());
-    if missing > 0 {
-        eprintln!(
-            "Note: {missing} page(s) failed and are marked with placeholders in the document."
-        );
+    let done = texts.iter().filter(|text| text.is_some()).count();
+    println!(
+        "\nWrote {}: {done} of {} pages transcribed.",
+        path.display(),
+        all.len()
+    );
+    if !unsplit.is_empty() {
+        println!("Not split into pages: {}", unsplit.join(", "));
+    }
+    if !gaps.is_empty() {
+        println!("Not transcribed: {}", gaps.join(", "));
     }
     Ok(())
+}
+
+/// Record a run of pages without a transcription, given as indices into
+/// `all`, and mark it in the document.
+fn close_gap(
+    gap: Option<(usize, usize)>,
+    all: &[Entry],
+    gaps: &mut Vec<String>,
+    sections: &mut Vec<String>,
+) {
+    if let Some((first, last)) = gap {
+        let label = range_label(&all[first].label, &all[last].label);
+        sections.push(format!("<!-- {label}: not transcribed -->"));
+        gaps.push(label);
+    }
+}
+
+/// A raw response in the work directory, for the pages `first..=last` of `all`.
+struct RawResponse {
+    first: usize,
+    last: usize,
+    text: String,
+}
+
+/// The raw responses in `dir` (named like `12-16.raw.md` by `deliver`) whose
+/// pages all still lack a file of their own. Raw responses whose pages all have
+/// one now are obsolete and deleted; partly covered ones are left alone.
+fn raw_responses(dir: &Path, all: &[Entry], texts: &[Option<String>]) -> Result<Vec<RawResponse>> {
+    let index: HashMap<&str, usize> = all
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| (entry.name.as_str(), i))
+        .collect();
+    let mut raws = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
+    for entry in entries {
+        let path = entry?.path();
+        let Some(range) = file_name(&path)
+            .strip_suffix(".raw.md")
+            .and_then(|stem| raw_range(stem, &index))
+        else {
+            continue;
+        };
+        let (first, last) = range;
+        let pages = &texts[first..=last];
+        if pages.iter().all(Option::is_some) {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        } else if pages.iter().all(Option::is_none) {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            raws.push(RawResponse { first, last, text });
+        }
+    }
+    raws.sort_by_key(|raw| raw.first);
+    Ok(raws)
+}
+
+/// The indices of the first and last page in a raw response's name such as
+/// `12-16`. Page names may contain `-` themselves, so every split is tried.
+fn raw_range(stem: &str, index: &HashMap<&str, usize>) -> Option<(usize, usize)> {
+    stem.match_indices('-').find_map(|(at, _)| {
+        let first = *index.get(&stem[..at])?;
+        let last = *index.get(&stem[at + 1..])?;
+        (first <= last).then_some((first, last))
+    })
+}
+
+/// The contents of `path`, or `None` if it doesn't exist.
+fn read_if_exists(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 fn file_stem(path: &Path) -> String {
@@ -848,5 +964,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn combined_file_marks_each_gap_once() {
+        let (dir, input, _) = book_dir("combined");
+        let work = work_dir_path(&input).unwrap();
+        assert_eq!(work, dir.join("Kniha – časť 1.btr"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("2.md"), "two").unwrap();
+        std::fs::write(work.join("5.md"), "five").unwrap();
+        std::fs::write(work.join("6.md"), "six").unwrap();
+        // Stands in for pages 3 and 4.
+        std::fs::write(work.join("3-4.raw.md"), "three and four").unwrap();
+        // Page 2 has its own file: ignored, but kept for page 1.
+        std::fs::write(work.join("1-2.raw.md"), "one and two").unwrap();
+        // Both pages have their own files: obsolete.
+        std::fs::write(work.join("5-6.raw.md"), "five and six").unwrap();
+        let all: Vec<Entry> = (1..=7)
+            .map(|page| Entry {
+                name: page.to_string(),
+                label: format!("page {page}"),
+            })
+            .collect();
+
+        let combined = combined_output_path(&input).unwrap();
+        write_combined(&combined, &work, &all).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&combined).unwrap(),
+            "<!-- page 1: not transcribed -->\n\ntwo\n\n\
+<!-- page 3 to page 4: not split into pages -->\n\nthree and four\n\n\
+five\n\nsix\n\n<!-- page 7: not transcribed -->"
+        );
+        assert!(work.join("1-2.raw.md").exists());
+        assert!(work.join("3-4.raw.md").exists());
+        assert!(!work.join("5-6.raw.md").exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raw_range_allows_dashes_in_page_names() {
+        let index: HashMap<&str, usize> = [("scan-1", 0), ("scan-2", 1)].into();
+        assert_eq!(raw_range("scan-1-scan-2", &index), Some((0, 1)));
+        assert_eq!(raw_range("scan-2-scan-1", &index), None);
+        assert_eq!(raw_range("scan-1", &index), None);
     }
 }

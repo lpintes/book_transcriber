@@ -72,7 +72,7 @@ The program is called btr:
 btr book.pdf
 ```
 
-Transcribes all pages in book.pdf, and puts them into a book.md file.
+Transcribes all pages in book.pdf, and puts them into a book.md file. Each page is saved as soon as it is done, one file per page, into the work directory book.btr next to book.pdf, and book.md is put together from those files at the end. When a run is interrupted or some pages fail, run the same command again: finished pages are skipped and book.md is regenerated. Pages without a transcription are marked in book.md with a line such as `<!-- page 51 to page 300: not transcribed -->`, so a book can also be done in parts with `-s` and `-n` (see below). When the model's response to several pages at once (`--batch-size`) cannot be split into pages, it is kept in the work directory and included in book.md as one block, marked `not split into pages`, until those pages are transcribed again. An existing book.md without a work directory next to it is not replaced unless you pass `--overwrite`.
 
 ```sh
 btr book.pdf output_directory
