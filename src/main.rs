@@ -43,7 +43,7 @@ and do not wrap your answer in a code fence. Output only the transcription.";
 /// Markdown using a vision-capable LLM.
 #[derive(Parser, Debug)]
 // Plain text only: colored output reads poorly with a screen reader.
-#[command(version, about, color = clap::ColorChoice::Never)]
+#[command(name = "btr", version, about, color = clap::ColorChoice::Never)]
 struct Args {
     /// Input source: a directory of images (.png / .jpg / .jpeg), a .pdf file
     /// or a .djvu file. A prompt file named after it (e.g. `book.prompt` next to

@@ -1,10 +1,9 @@
 //! End-to-end test of the claude-cli backend against a fake `claude`.
 //!
 //! This test binary plays both roles. Run by cargo, it writes a config whose
-//! `command` points at itself and runs book_transcriber. Run by
-//! book_transcriber with the CLI's arguments, it acts as the fake `claude`:
-//! it checks the arguments and the stdin message and prints canned
-//! stream-json output.
+//! `command` points at itself and runs btr. Run by btr with the CLI's
+//! arguments, it acts as the fake `claude`: it checks the arguments and the
+//! stdin message and prints canned stream-json output.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -230,7 +229,7 @@ impl Fixture {
         } else {
             input.parent().unwrap()
         };
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_book_transcriber"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_btr"));
         cmd.arg(input);
         if let Some(output) = output {
             cmd.arg(output);
@@ -313,7 +312,7 @@ fn missing_cli_is_reported_up_front() {
 /// same usage error clap reported when the argument was required.
 fn missing_input_is_a_usage_error() {
     let fixture = Fixture::new("no-input");
-    let output = Command::new(env!("CARGO_BIN_EXE_book_transcriber"))
+    let output = Command::new(env!("CARGO_BIN_EXE_btr"))
         .arg("--config")
         .arg(fixture.root.join("missing.toml"))
         .output()

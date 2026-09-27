@@ -16,6 +16,10 @@ dirs = "5"
 image = { version = "0.25", default-features = false, features = ["png", "pnm"] }
 mupdf = { version = "0.8.0", optional = true }
 
+[[bin]]
+name = "btr"
+path = "src/main.rs"
+
 [[test]]
 # Doubles as the fake `claude` program, so it provides its own main().
 name = "claude_cli"

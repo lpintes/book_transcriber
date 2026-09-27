@@ -66,7 +66,7 @@ PDF and DjVu pages are rendered to images at 200 DPI by default. `--dpi` overrid
 
 ### Transcription
 
-I like to alias book_transcriber as btr:
+The program is called btr:
 
 ```sh
 btr book.pdf
@@ -130,7 +130,7 @@ You need [Rust](https://rustup.rs). On Linux nothing else is needed. On Windows,
 cargo build --release -q
 ```
 
-The result will be placed in the target/release directory (`book_transcriber` on Linux, `book_transcriber.exe` on Windows). Copy it to a directory in PATH, or run `cargo install --path .`.
+The result will be placed in the target/release directory (`btr` on Linux, `btr.exe` on Windows). Copy it to a directory in PATH, or run `cargo install --path .`.
 
 ### Rendering PDFs with MuPDF
 
