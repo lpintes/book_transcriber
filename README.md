@@ -64,6 +64,8 @@ Things worth knowing about this backend:
 
 PDF and DjVu pages are rendered to images at 200 DPI by default. `--dpi` overrides this for one run, and a model can set its own default with `dpi` in its config section. Claude models scale images down anyway once their longer side exceeds about 1568 pixels (2576 for the newest models), while an A4 page at 200 DPI is about 1650 by 2340 pixels, so around 130 to 150 DPI sends less data without losing detail.
 
+Each page is rendered just before it is sent to the model, so transcription starts right away. The images are kept in the output or work directory, in a subdirectory per resolution such as `images-150dpi`, and later runs reuse them instead of rendering the pages again. They take some disk space, typically a few hundred kilobytes to a megabyte per page; the directory can be deleted at any time and is rendered again when needed.
+
 ### Transcription
 
 The program is called btr:

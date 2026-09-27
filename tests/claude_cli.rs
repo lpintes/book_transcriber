@@ -351,14 +351,29 @@ fn transcribes_a_pdf_with_diacritics_in_its_path() {
         text,
         "Fake transcription of 1 image(s).\n\nFake transcription of 1 image(s)."
     );
-    // The pages are also kept one per file in the work directory.
+    // The pages and their images are also kept in the work directory.
+    let work = fixture.root.join("Kniha – časť 1.btr");
+    let images = work.join("images-200dpi");
+    assert!(work.join("2.md").is_file());
+    assert!(images.join("1.png").is_file());
+    assert!(!images.join("2.partial.png").exists());
+
+    // A page image from an earlier run is reused, not rendered again.
+    std::fs::remove_file(work.join("2.md")).unwrap();
+    let png = BASE64.decode(RED_PNG).unwrap();
+    std::fs::write(images.join("2.png"), &png).unwrap();
+    let output = fixture.run_with(&pdf, None, &[], None);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        fixture
-            .root
-            .join("Kniha – časť 1.btr")
-            .join("2.md")
-            .is_file()
+        output.status.success(),
+        "btr failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+    assert!(
+        stdout.contains("1 to transcribe, 1 already done"),
+        "{stdout}"
+    );
+    assert_eq!(std::fs::read(images.join("2.png")).unwrap(), png);
 }
 
 fn single_file_mode_resumes_from_the_work_directory() {
@@ -425,4 +440,8 @@ fn transcribes_remaining_djvu_pages() {
     let page = |name: &str| std::fs::read_to_string(fixture.out.join(name)).unwrap();
     assert_eq!(page("1.md"), "done earlier");
     assert_eq!(page("2.md"), "Fake transcription of 1 image(s).");
+    // Only the page that was transcribed is rendered.
+    let images = fixture.out.join("images-200dpi");
+    assert!(!images.join("1.png").exists());
+    assert!(images.join("2.png").is_file());
 }

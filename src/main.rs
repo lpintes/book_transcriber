@@ -11,8 +11,8 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
 
 use anyhow::{Context, Result, bail};
@@ -109,26 +109,6 @@ impl Args {
         self.input
             .as_deref()
             .expect("input is checked at the start of run")
-    }
-}
-
-/// A temporary directory removed when this guard is dropped.
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> Result<Self> {
-        let path = std::env::temp_dir().join(format!("book_transcriber-{}", std::process::id()));
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("creating temp directory {}", path.display()))?;
-        Ok(Self { path })
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -245,18 +225,17 @@ or give an output directory to write one file per page",
     }
 
     // Build the list of pages to transcribe from a PDF, a DjVu or an image dir.
-    // For a document, rendered page images live in `_tmp`, kept alive until the run
-    // finishes.
-    let mut _tmp: Option<TempDir> = None;
-    let (pending, all) = match document {
-        Some(kind) => {
-            let doc = kind.open(args.input())?;
-            let (pages, all, tmp) =
-                document_pages(&args, &output.dir, doc.as_ref(), kind.name(), dpi)?;
-            _tmp = Some(tmp);
-            (pages, all)
+    // Document pages are rendered into the output directory while the run goes
+    // on, and kept for later runs.
+    let doc = match document {
+        Some(kind) => Some(kind.open(args.input())?),
+        None => None,
+    };
+    let (pending, all) = match (document, &doc) {
+        (Some(kind), Some(doc)) => {
+            document_pages(&args, &output.dir, doc.as_ref(), kind.name(), dpi)?
         }
-        None => image_dir_pages(&args, &output.dir)?,
+        _ => image_dir_pages(&args, &output.dir)?,
     };
 
     if pending.is_empty() {
@@ -284,11 +263,22 @@ or give an output directory to write one file per page",
 
     // Shared state for the worker pool.
     let next = AtomicUsize::new(0); // index of the next batch to claim
+    let attempted = AtomicUsize::new(0); // batches sent to the model
     let done = AtomicUsize::new(0); // completed batches, for progress display
     let stop = AtomicBool::new(false); // set after a fatal error
     let total = Mutex::new(Usage::default());
     let print_lock = Mutex::new(()); // serializes multi-line console output
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    // How many pending pages have their image ready, in order.
+    let ready = Mutex::new(0usize);
+    let ready_changed = Condvar::new();
+    let halt = || {
+        stop.store(true, AtomicOrdering::Relaxed);
+        // Taking the lock keeps a worker from missing the wake-up between
+        // checking `stop` and starting to wait.
+        let _ready = ready.lock().unwrap();
+        ready_changed.notify_all();
+    };
 
     thread::scope(|scope| {
         for _ in 0..workers {
@@ -302,10 +292,23 @@ or give an output directory to write one file per page",
                         break;
                     }
                     let batch = batches[idx];
+                    // Wait until this batch's pages are rendered.
+                    let needed = idx * args.batch_size + batch.len();
+                    let mut count = ready.lock().unwrap();
+                    while *count < needed && !stop.load(AtomicOrdering::Relaxed) {
+                        count = ready_changed.wait(count).unwrap();
+                    }
+                    let rendered = *count >= needed;
+                    drop(count);
+                    if !rendered {
+                        break;
+                    }
+
                     let paths: Vec<&Path> = batch.iter().map(|p| p.image.as_path()).collect();
                     let batch_prompt = build_prompt(&prompt, batch.len());
                     let label = batch_label(batch);
 
+                    attempted.fetch_add(1, AtomicOrdering::Relaxed);
                     match backend.transcribe(&batch_prompt, &paths, retry) {
                         Ok((text, usage)) => {
                             total.lock().unwrap().add(&usage);
@@ -323,7 +326,7 @@ or give an output directory to write one file per page",
                         }
                         Err(e) => {
                             if e.downcast_ref::<Fatal>().is_some() {
-                                stop.store(true, AtomicOrdering::Relaxed);
+                                halt();
                             }
                             let _lock = print_lock.lock().unwrap();
                             eprintln!("{label}: failed: {e:#}");
@@ -332,6 +335,27 @@ or give an output directory to write one file per page",
                     }
                 }
             });
+        }
+
+        // This thread renders the pages in order, ahead of the workers.
+        for (i, page) in pending.iter().enumerate() {
+            if stop.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            if let (Some(number), Some(doc)) = (page.render, &doc)
+                && let Err(e) = render_page(doc.as_ref(), number, dpi, &page.image)
+            {
+                let _lock = print_lock.lock().unwrap();
+                eprintln!("{}: rendering failed: {e:#}", page.label);
+                failures
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}: rendering failed: {e:#}", page.label));
+                halt();
+                break;
+            }
+            *ready.lock().unwrap() = i + 1;
+            ready_changed.notify_all();
         }
     });
 
@@ -349,7 +373,7 @@ or give an output directory to write one file per page",
         for f in &failures {
             eprintln!("  {f}");
         }
-        let started = next.into_inner().min(total_batches);
+        let started = attempted.into_inner();
         if started < total_batches {
             eprintln!(
                 "Stopped after a fatal error; {} batch(es) were not attempted.",
@@ -381,8 +405,12 @@ struct Entry {
 
 /// One page to transcribe.
 struct Page {
-    /// Source image (an input file, or a rendered document page in a temp dir).
+    /// Source image (an input file, or a rendered document page in the output
+    /// directory).
     image: PathBuf,
+    /// The document page number to render into `image` first, if it isn't
+    /// rendered yet.
+    render: Option<usize>,
     /// Human-readable name for progress output (e.g. `12.png` or `page 3`).
     label: String,
     /// Destination file.
@@ -439,6 +467,7 @@ fn image_dir_pages(args: &Args, dir: &Path) -> Result<(Vec<Page>, Vec<Entry>)> {
         }
         pending.push(Page {
             image: img.clone(),
+            render: None,
             label: file_name(img),
             output: out,
         });
@@ -463,16 +492,17 @@ fn image_dir_pages(args: &Args, dir: &Path) -> Result<(Vec<Page>, Vec<Entry>)> {
 }
 
 /// Selected, not-yet-done pages from a paged document such as a PDF (`kind`
-/// names it in messages), and all its pages as entries. Each pending page is
-/// rendered to a PNG in a temp directory (returned so it outlives
-/// transcription); output files are named by page number (e.g. `3.md`).
+/// names it in messages), and all its pages as entries. Page images go into a
+/// subdirectory of `dir` per resolution (e.g. `images-200dpi/3.png`), where
+/// pages rendered by an earlier run are reused; output files are named by page
+/// number (e.g. `3.md`).
 fn document_pages(
     args: &Args,
     dir: &Path,
     doc: &dyn PageSource,
     kind: &str,
     dpi: f32,
-) -> Result<(Vec<Page>, Vec<Entry>, TempDir)> {
+) -> Result<(Vec<Page>, Vec<Entry>)> {
     let total = doc.page_count()?;
     if total == 0 {
         bail!("{kind} {} has no pages", args.input().display());
@@ -489,12 +519,12 @@ fn document_pages(
         Some(n) => (start_idx + n).min(total),
         None => total,
     };
-    println!(
-        "{kind}: {total} pages; rendering pages {} to {end} at {dpi:.0} DPI.",
-        args.start
-    );
+    let images = dir.join(format!("images-{dpi}dpi"));
+    std::fs::create_dir_all(&images)
+        .with_context(|| format!("creating directory {}", images.display()))?;
+    println!("{kind}: {total} pages, rendered at {dpi} DPI.");
+    println!("Page images: {}", images.display());
 
-    let tmp = TempDir::new()?;
     let mut pending = Vec::new();
     let mut skipped = 0usize;
     for page in args.start..=end {
@@ -505,10 +535,9 @@ fn document_pages(
             skipped += 1;
             continue;
         }
-        let image = tmp.path.join(format!("{name}.png"));
-        doc.render_png(page, dpi, &image)
-            .with_context(|| format!("rendering {kind} page {page}"))?;
+        let image = images.join(format!("{name}.png"));
         pending.push(Page {
+            render: (!image.exists()).then_some(page),
             image,
             label: format!("page {page}"),
             output: out,
@@ -526,7 +555,16 @@ fn document_pages(
         args.start,
         pending.len()
     );
-    Ok((pending, all, tmp))
+    Ok((pending, all))
+}
+
+/// Render document `page` into `dest` by way of a partial file, so that an
+/// interrupted run never leaves a broken image for the next one to reuse.
+fn render_page(doc: &dyn PageSource, page: usize, dpi: f32, dest: &Path) -> Result<()> {
+    let partial = dest.with_extension("partial.png");
+    doc.render_png(page, dpi, &partial)?;
+    std::fs::rename(&partial, dest)
+        .with_context(|| format!("renaming {} to {}", partial.display(), dest.display()))
 }
 
 /// A file next to the input, named after it with extension `ext`:
